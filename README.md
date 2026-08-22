@@ -5,10 +5,9 @@
     a lightweight canvas-based window manager written in <b>XCB</b>, inspired by
     <a href="https://github.com/esnokum-dacom/SOWM-Plus-Plus">SOWM++</a>.
   </p>
-  <p>
-    <img src="sbcwm.png" width="59%" align="center">
-  </p>
 </div>
+
+https://github.com/user-attachments/assets/973f6a31-f405-480c-adfd-e7f9c1d4b781
 
 ---
 
