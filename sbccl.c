@@ -34,7 +34,7 @@ static FuncEntry funcs[] = {
     {"win_kill", win_kill}, {"win_center", win_center}, {"win_fs", win_fs},
     {"run", run}, {"quit", quit}, {"canvas_pan_key", canvas_pan_key},
     {"canvas_reset", canvas_reset},     {"move_nextmon", move_nextmon},
-    {"ws_focusnext", ws_focusnext}, {"toggle_minimap", toggle_minimap},
+    {"ws_focusnext", ws_focusnext},
     {"toggle_icons", toggle_icons},
     {"reload_config", reload_config},
 };

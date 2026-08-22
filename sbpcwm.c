@@ -38,11 +38,6 @@ const FcChar8 *max_sym = (FcChar8 *)"󰝣";
 static client *list = NULL;
 static client *cur  = NULL;
 
-static XftFont  *mm_font = NULL;
-static XftDraw  *mm_draw = NULL;
-static XftColor  mm_color;
-static int mm_inited = 0;
-
 static XftFont *title_font  = NULL;
 static XftFont *button_font = NULL;
 
@@ -78,8 +73,6 @@ int                depth;
 static xcb_key_symbols_t *keysyms;
 
 xcb_window_t root;
-static xcb_window_t minimap_win[MAX_MONITORS] = {0};static xcb_pixmap_t minimap_pix[MAX_MONITORS] = {0};
-static xcb_gcontext_t minimap_gc = 0;
 
 ColorScheme cols;
 static xcb_window_t notify_win = XCB_NONE;
@@ -100,11 +93,6 @@ static xcb_atom_t net_supported, net_wm_window_type, net_wm_window_type_dock,
                   wm_protocols, wm_normal_hints_atom, net_client_list_stacking;
 
 static int strut[4] = {0, 0, 0, 0};
-static long mm_last_update_ms = 0;
-
-int             minimap = 1;
-static int      minimap_px[MAX_MONITORS] = {0};
-static int      minimap_py[MAX_MONITORS] = {0};
 
 static xcb_window_t drag_subwindow = 0;
 static uint16_t     drag_button    = 0;
@@ -270,195 +258,12 @@ XftFont *open_font(const char *name) {
 }
 
 void fonts_reload(void) {
-    if (mm_font)     XftFontClose(dpy, mm_font);
-    mm_font = open_font(cfg->fonts);
     if (title_font)  XftFontClose(dpy, title_font);
     title_font = open_font(cfg->fontb);
     if (button_font) XftFontClose(dpy, button_font);
     button_font = open_font(cfg->fontb);
     if (notify_font) XftFontClose(dpy, notify_font);
     notify_font = open_font(cfg->fonts);
-}
-
-static void minimap_init(void) {
-    if (mm_inited) return;
-    XRenderColor xr = { .red = 0, .green = 0, .blue = 0, .alpha = 0xFFFF };
-    XftColorAllocValue(dpy, visual, cmap, &xr, &mm_color);
-    mm_font = open_font(cfg->fonts);
-    mm_inited = 1;
-}
-
-void minimap_create(void) {
-    monitors_refresh();
-
-    int x0 = 1<<30, y0 = 1<<30, x1 = 0, y1 = 0;
-    for (int i = 0; i < n_mons; i++) {
-        x0 = MIN(x0, mons[i].x);
-        y0 = MIN(y0, mons[i].y);
-        x1 = MAX(x1, mons[i].x + mons[i].w);
-        y1 = MAX(y1, mons[i].y + mons[i].h);
-    }
-
-    float layout_w = (float)(x1 - x0);
-    float layout_h = (float)(y1 - y0);
-    float box_w = 220, box_h = 220;
-    float scale = MIN(box_w / layout_w, box_h / layout_h);
-
-    int gap = 5;
-    int origin_x = 10, origin_y = 10;
-
-    minimap_gc = xcb_generate_id(conn);
-    xcb_create_gc(conn, minimap_gc, root, 0, NULL);
-
-    for (int i = 0; i < n_mons; i++) {
-        int rank_x = 0, rank_y = 0;
-        for (int j = 0; j < n_mons; j++) {
-            if (mons[j].x < mons[i].x) rank_x++;
-            if (mons[j].y < mons[i].y) rank_y++;
-        }
-
-        int px = origin_x + (int)((mons[i].x - x0) * scale) + rank_x * gap;
-        int py = origin_y + (int)((mons[i].y - y0) * scale) + rank_y * gap;
-        minimap_px[i] = px;
-        minimap_py[i] = py;
-        int pw = MAX(40, (int)(mons[i].w * scale));
-        int ph = MAX(30, (int)(mons[i].h * scale));
-
-        minimap_win[i] = xcb_generate_id(conn);
-        uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL |
-                         XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
-        uint32_t values[] = { 0x111111, 0x444444, 1, XCB_EVENT_MASK_EXPOSURE };
-        xcb_create_window(conn, XCB_COPY_FROM_PARENT, minimap_win[i], root,
-                           (int16_t)px, (int16_t)py, (uint16_t)pw, (uint16_t)ph, 0,
-                           XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual,
-                           mask, values);
-
-        minimap_pix[i] = xcb_generate_id(conn);
-        xcb_create_pixmap(conn, depth, minimap_pix[i], root, (uint16_t)pw, (uint16_t)ph);
-
-        xcb_map_window(conn, minimap_win[i]);
-        uint32_t stack = XCB_STACK_MODE_ABOVE;
-        xcb_configure_window(conn, minimap_win[i], XCB_CONFIG_WINDOW_STACK_MODE, &stack);
-    }
-    xcb_flush(conn);
-}
-
-static void minimap_draw_one(xcb_window_t panel, int mon, int mon_w, int mon_h, int mon_x, int mon_y) {
-    if (!panel) return;
-    if (mon_w <= 0 || mon_h <= 0) return;
-
-    minimap_init();
-
-    unsigned int mw, mh;
-    int mxw, myw;
-    win_size(panel, &mxw, &myw, &mw, &mh);
-
-    xcb_pixmap_t buf = minimap_pix[mon];
-    if (!buf) return;
-
-    if (mm_draw) XftDrawDestroy(mm_draw);
-    mm_draw = XftDrawCreate(dpy, buf, visual, cmap);
-
-    uint32_t fg = 0x111111;
-    xcb_change_gc(conn, minimap_gc, XCB_GC_FOREGROUND, &fg);
-    xcb_rectangle_t full = { 0, 0, (uint16_t)mw, (uint16_t)mh };
-    xcb_poly_fill_rectangle(conn, buf, minimap_gc, 1, &full);
-
-    float minx =  1e9f, miny =  1e9f;
-    float maxx = -1e9f, maxy = -1e9f;
-    int   any  = 0;
-
-    for win {
-        if (c->mon != mon) continue;
-        any  = 1;
-        minx = MIN(minx, c->cx);
-        miny = MIN(miny, c->cy);
-        maxx = MAX(maxx, c->cx + c->width);
-        maxy = MAX(maxy, c->cy + c->height);
-    }
-
-    float vx0 = mon_x + canvas.pan_x[mon];
-    float vy0 = mon_y + canvas.pan_y[mon];
-    float vx1 = vx0 + mon_w;
-    float vy1 = vy0 + mon_h;
-
-    if (!any) { minx = vx0; miny = vy0; maxx = vx1; maxy = vy1; }
-    minx = MIN(minx, vx0); miny = MIN(miny, vy0);
-    maxx = MAX(maxx, vx1); maxy = MAX(maxy, vy1);
-
-    float bw = MAX(maxx - minx, 1.0f);
-    float bh = MAX(maxy - miny, 1.0f);
-    float scale = MIN(((float)mw - 8) / bw, ((float)mh - 8) / bh);
-
-#define MM_X(v) (int)(4 + ((v) - minx) * scale)
-#define MM_Y(v) (int)(4 + ((v) - miny) * scale)
-
-    uint32_t frame_fg = 0x555555;
-    xcb_change_gc(conn, minimap_gc, XCB_GC_FOREGROUND, &frame_fg);
-    xcb_rectangle_t frame = {
-        (int16_t)MM_X(vx0), (int16_t)MM_Y(vy0),
-        (uint16_t)MAX(1, (int)((vx1 - vx0) * scale)),
-        (uint16_t)MAX(1, (int)((vy1 - vy0) * scale)),
-    };
-    xcb_poly_rectangle(conn, buf, minimap_gc, 1, &frame);
-
-    for win {
-        if (c->mon != mon) continue;
-
-        int rx = MM_X(c->cx);
-        int ry = MM_Y(c->cy);
-        int rw = MAX(2, (int)(c->width  * scale));
-        int rh = MAX(2, (int)(c->height * scale));
-
-        uint32_t box_fg = (c == cur) ? 0xffffff : 0x505050;
-        xcb_change_gc(conn, minimap_gc, XCB_GC_FOREGROUND, &box_fg);
-        xcb_rectangle_t box = { (int16_t)rx, (int16_t)ry, (uint16_t)rw, (uint16_t)rh };
-        xcb_poly_fill_rectangle(conn, buf, minimap_gc, 1, &box);
-
-        char *title = client_get_title(c->w);
-        if (!title) title = copystr("");
-
-        if (mm_font) {
-            XGlyphInfo ext;
-            XftTextExtentsUtf8(dpy, mm_font, (FcChar8 *)title, (int)strlen(title), &ext);
-            int bx = rx + rw / 2, by = ry + ext.height + 5;
-            int x = bx - ext.xOff / 2;
-
-            XftDrawStringUtf8(mm_draw, &mm_color, mm_font, x, by, (FcChar8 *)title, (int)strlen(title));
-        }
-        free(title);
-
-        xcb_flush(conn);
-        XFlush(dpy);
-    }
-
-#undef MM_X
-#undef MM_Y
-    xcb_copy_area(conn, buf, panel, minimap_gc, 0, 0, 0, 0, (uint16_t)mw, (uint16_t)mh);
-    uint32_t stack = XCB_STACK_MODE_ABOVE;
-    xcb_configure_window(conn, panel, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
-}
-
-void minimap_update(void) {
-    long t = now_ms();
-    if (t - mm_last_update_ms < 33) return;
-    mm_last_update_ms = t;
-
-    for (int i = 0; i < n_mons; i++)
-        minimap_draw_one(minimap_win[i], i, mons[i].w, mons[i].h, mons[i].x, mons[i].y);
-    xcb_flush(conn);
-}
-
-void toggle_minimap(const Arg arg) {
-    (void)arg;
-    minimap = !minimap;
-    for (int i = 0; i < MAX_MONITORS; i++) {
-        if (!minimap_win[i]) continue;
-        if (minimap) xcb_map_window(conn, minimap_win[i]);
-        else         xcb_unmap_window(conn, minimap_win[i]);
-    }
-    minimap_update();
-    xcb_flush(conn);
 }
 
 static int dock_known(xcb_window_t w) {
@@ -798,7 +603,6 @@ void client_resize(client *c, unsigned int w, unsigned int h) {
     int nw = (int)w, nh = (int)h;
     if (applysizehints(c, &nw, &nh))
         resizeclient(c, nw, nh);
-    minimap_update();
     if (c->titlebar) titlebar_update(c);
 }
 
@@ -924,7 +728,6 @@ void canvas_apply_all(void) {
     }
 
     xcb_flush(conn);
-    minimap_update();
     titlebar_update(cur);
     canvas_sync_to_root();
     icons_reposition();
@@ -1384,7 +1187,6 @@ void notify_destroy(xcb_destroy_notify_event_t *gen_e) {
     if (!managed) return;
 
     win_del(e->window);
-    minimap_update();
 
     win_focus(NULL);
     titlebar_update(cur);
@@ -1480,7 +1282,6 @@ void notify_enter(xcb_enter_notify_event_t *e) {
             win_focus(c);
             if (c->titlebar) titlebar_update(c);
         }
-    minimap_update();
     titlebar_update(cur);
 }
 
@@ -1538,7 +1339,6 @@ void notify_motion(xcb_motion_notify_event_t *e) {
             xcb_configure_window(conn, cur->titlebar, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
         }
         docks_raise();
-        minimap_update();
  
         int m = cur->mon;
         cur->cx = (float)new_sx + canvas.pan_x[m];
@@ -1813,7 +1613,6 @@ void win_center(const Arg arg) {
     int m = cur->mon;
     cur->cx = (float)sx + canvas.pan_x[m];
     cur->cy = (float)sy + canvas.pan_y[m];
-    minimap_update();
 }
 
 static int spawn_spot_free(const client *skip, int sx, int sy, unsigned int ww, unsigned int wh) {
@@ -1898,7 +1697,6 @@ void win_place_free(client *c) {
     int m = c->mon;
     c->cx = (float)fx + canvas.pan_x[m];
     c->cy = (float)fy + canvas.pan_y[m];
-    minimap_update();
 }
 
 void win_fs(const Arg arg) {
@@ -1935,7 +1733,6 @@ void win_fs(const Arg arg) {
             client_move(cur, mx, my);
 
         }
-        minimap_update();
 	snprintf(buf, sizeof(buf), "%s: Fulscreen", win_title ? win_title : "");
         if (cur->titlebar) titlebar_update(cur);
         if (!cfg->titlebar && cur->titlebar) xcb_unmap_window(conn, cur->titlebar);
@@ -1945,7 +1742,6 @@ void win_fs(const Arg arg) {
 	if (fs_grab_win == cur->w) { xcb_ungrab_pointer(conn, XCB_CURRENT_TIME); fs_grab_win = XCB_NONE; }
         resizeclient(cur, (int)cur->ww, (int)cur->wh);
         client_move(cur, cur->wx, cur->wy);
-        minimap_update();
 	snprintf(buf, sizeof(buf), "%s: Floating", win_title ? win_title : "");
         if (cur->titlebar) {
             xcb_map_window(conn, cur->titlebar);
@@ -2174,7 +1970,6 @@ void map_request(xcb_map_request_event_t *e) {
     if (cur->titlebar) titlebar_update(cur);
  
     xcb_map_window(conn, w);
-    minimap_update();
     cur = oc;
     win_focus(list->prev);
     docks_raise();
@@ -2339,7 +2134,6 @@ void ws_focusnext(const Arg arg) {
     xcb_warp_pointer(conn, XCB_NONE, root, 0, 0, 0, 0,
                       (int16_t)(mons[next].x + mons[next].w / 2),
                       (int16_t)(mons[next].y + mons[next].h / 2));
-    minimap_update();
     titlebar_update(cur);
     free(ptr);
     xcb_flush(conn);
@@ -2368,7 +2162,6 @@ void move_nextmon(const Arg arg) {
         int new_sx = mons[next].x + (mons[next].w - (int)cw) / 2;
         int new_sy = mons[next].y + (mons[next].h - (int)ch) / 2;
         client_move(cur, new_sx, new_sy);
-        minimap_update();
         titlebar_update(cur);
         set_client_monitor(cur, next);
         cur->cx = (float)new_sx + canvas.pan_x[next];
@@ -2547,18 +2340,6 @@ int main(void) {
     load_colors();
 
     input_grab(root);
-
-    if (cfg->ui) {
-        minimap_create();
-        minimap_update();
-        if (!minimap) {
-            for (int i = 0; i < MAX_MONITORS; i++)
-                if (minimap_win[i]) {
-                    uint32_t v[2] = { (uint32_t)-800, (uint32_t)minimap_py[i] };
-                    xcb_configure_window(conn, minimap_win[i], XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, v);
-                }
-        }
-    }
 
     icons_load_state(cfg);
     if (cfg->ui) icons_rebuild();

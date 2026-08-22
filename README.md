@@ -50,7 +50,7 @@ All tuning knobs live at the top of [`sbcwm.h`](sbcwm.h):
 A stacking window manager built directly on **XCB (X C Binding)** instead of Xlib,
 with a few extras plain sowm doesn't have:
 
-- **Lua runtime configuration** (`config.lua`) — reloadable while running
+- **Lua runtime configuration** (`config.lua`) — reloadable while running (It uses the same directory ~/.config/sbcwm/)
 - **Canvas panning** — an infinite desktop you can move around with keyboard or mouse
 - **Minimap** — a live overview of your canvas
 - **Titlebars** with close / maximize buttons (drawn via Xft)
@@ -154,7 +154,6 @@ Dragging one window into another pushes the other window away.
 | `MOD1` + `TAB` (*alt-tab*)       | focus cycle                  |
 | `MOD1` + `Shift` + `Left/Right`  | pan canvas left / right      |
 | `MOD1` + `Shift` + `Up/Down`     | pan canvas up / down         |
-| `MOD1` + `b`                     | toggle minimap               |
 
 > Keybindings come from `config.lua` — the defaults above are just what's shipped.
 > Rebind anything without touching the source.

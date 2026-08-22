@@ -163,10 +163,6 @@ void win_place_free(client *c);
 
 void hud_update(void);
 
-void minimap_create(void);
-void minimap_update(void);
-void toggle_minimap(const Arg arg);
-
 void titlebar_update(client *c);
 xcb_window_t titlebar_create(client *c);
 void titlebar_draw(client *c);
