@@ -1,39 +1,63 @@
 <div align="center">
-  <h1>ScbWM</h1>
+  <h1>sbcwm — experimental fork (Warning AI!)</h1>
   <p>
-    <b>S</b>ome <b>C</b>ompact <b>b</b>ox <b>WM</b> — a lightweight, canvas-based window manager written in <b>XCB</b>,
-    inspired by <a href="https://github.com/esnokum-dacom/SOWM-Plus-Plus">SOWM++</a>.
+    <b>EXPERIMENTAL</b> — a fork of <a href="https://github.com/esnokum-dacom/sbpcwm">sbcwm</a>,
+    a lightweight canvas-based window manager written in <b>XCB</b>, inspired by
+    <a href="https://github.com/esnokum-dacom/SOWM-Plus-Plus">SOWM++</a>.
   </p>
   <p>
-    <img src="https://github.com/esnokum-dacom/sbcwm/blob/main/sbcwm.png" width="59%" align="center">
+    <img src="sbcwm.png" width="59%" align="center">
   </p>
 </div>
 
 ---
 
-## What is it?
+## Status: experimental
 
-ScbWM is a stacking window manager built directly on **XCB (X C Binding)** instead of Xlib. The code follows the same spirit and layout as SOWM++, but XCB keeps the runtime footprint smaller and the codebase closer to the wire protocol.
+This is a playground fork. Expect rough edges, breaking changes and weird behavior.
+The whole point of this fork is to turn window management into a **physics sandbox**:
 
-It ships with a few extras that plain sowm doesn't have:
+- **Windows collide with each other.** Elastic AABB collisions with mass proportional to
+  window area, restitution, positional correction — throw one window into a stack and
+  watch the chain reaction. Only managed clients participate; override-redirect windows,
+  docks, menus and fullscreen windows are never simulated.
+- **Throw your windows.** Release a drag while moving and the window keeps its momentum,
+  glides, bounces off other windows and settles by friction. While you drag, your window
+  acts as an infinite-mass body that shoves everything else out of the way.
+- **New windows never spawn on top of others.** Placement starts at the center of the
+  pointer's monitor and spirals outwards — first inside the monitor, then across the
+  whole canvas — until a free rectangle is found.
+- **No walls.** Windows can travel to any part of the infinite canvas, including outside
+  the visible monitor. Collisions are resolved per-monitor, so a window flying over
+  another monitor's territory does not interact with that monitor's windows.
+- Physics runs on a fixed tick inside the main event loop (~60 fps) and sleeps completely
+  when nothing is moving.
+
+All tuning knobs live at the top of [`sbcwm.h`](sbcwm.h):
+
+```c
+#define PHYS_ENABLED      1     /* master switch                          */
+#define PHYS_RESTITUTION  0.55f /* bounciness of window-window hits       */
+#define PHYS_FRICTION     4.0f  /* exponential damping per second         */
+#define PHYS_STOP_SPEED   8.0f  /* px/s below which a window sleeps       */
+#define PHYS_VMAX         3200.f/* velocity clamp                         */
+#define THROW_WINDOW_MS   120   /* pointer history used for flicks        */
+#define THROW_BOOST       1.15f /* flick speed multiplier                 */
+```
+
+## What is inherited from sbcwm?
+
+A stacking window manager built directly on **XCB (X C Binding)** instead of Xlib,
+with a few extras plain sowm doesn't have:
 
 - **Lua runtime configuration** (`config.lua`) — reloadable while running
-- **Canvas panning** — an infinite desktop you can move around with the keyboard or mouse
-- **HUD** that tracks window stack state across monitors
+- **Canvas panning** — an infinite desktop you can move around with keyboard or mouse
 - **Minimap** — a live overview of your canvas
-- **Titlebars** with close / maximize buttons (drawable via Xft icons)
+- **Titlebars** with close / maximize buttons (drawn via Xft)
 - **Desktop icon shortcuts** — spawn apps from icons on the canvas
 - **Right-click context menu** with your own entries
-- **`sbcwmctl`** — a socket-based control client for runtime options, config reload and icon/shortcut management
-
-## Memory footprint
-
-```
-ps -eo args,size,vsize,rss | grep -E 'sowm|sbcwm|dwm'
-sbcwm                        1832  16236  9440
-dwm                          1212  15928  8228
-sowm                         1256  13388  7996
-```
+- **`sbcwmctl`** — socket-based control client for runtime options, config reload and
+  icon/shortcut management
 
 ## Dependencies
 
@@ -57,11 +81,10 @@ cd sbcwm
 sudo make clean install
 ```
 
-After install you can tweak the running instance without recompiling — the wm reads your config from `~/.config/sbcwm/config.lua` (a copy is placed there by `make install`).
+The wm reads your config from `~/.config/sbcwm/config.lua` (a copy is placed there by
+`make install`). You can tweak the running instance without recompiling.
 
 ### Runtime configuration (config.lua)
-
-Most of the behaviour is Lua, so you can reload it live:
 
 ```lua
 -- ~/.config/sbcwm/config.lua
@@ -70,7 +93,7 @@ fonts = "Terminus:style=Regular:pixelsize=16:antialias=false"
 opts = {
   pan_step      = 120,     -- canvas pan distance per step
   titlebar      = 0,       -- enable/disable titlebars
-  ui            = 1,       -- show the HUD
+  ui            = 1,       -- show the minimap/HUD
   xr_colors     = 1,       -- use Xresources colors
   border        = 1,       -- draw window borders
   border_width  = 1,
@@ -81,17 +104,20 @@ opts = {
 -- right-click context menu entries
 ctx = {
   { label = "Terminal",  func = "run", arg = {"st"} },
-  { label = "Launcher",  func = "run", arg = {"lm"} },
-  { label = "Wallpaper", func = "run", arg = {"xwall"} },
   { label = "Icons",     func = "toggle_icons" },
 }
 
--- desktop icon shortcuts
-icons = {
-  { name = "Term", image = os.getenv("HOME") .. "/.config/sbcwm/icons/terminal.png",
-    x = 80, y = 80, cmd = {"st"} },
+keys = {
+  { mod = {"super", "shift"}, key = "c",     func = "win_kill" },
+  { mod = {"super"},          key = "f",     func = "win_fs" },
 }
 ```
+
+### Physics options
+
+Physics is compile-time only (it needs to touch the client structs directly).
+Edit the `PHYS_*` defines in `sbcwm.h` and recompile. Set `PHYS_ENABLED` to `0`
+to get plain sbcwm behavior back.
 
 #### Runtime options with sbcwmctl
 
@@ -107,36 +133,16 @@ sbcwmctl shortcut list
 sbcwmctl shortcut show on|off
 ```
 
-### Compile-time configuration (config.def.h)
-
-Things that are better baked into the binary live in `config.def.h`. Copy it to `config.h` and edit before compiling.
-
-Available toggles and defaults:
-
-```c
-#define TITLEBAR    0        /* window titlebars            */
-#define BORDER      1        /* window borders              */
-#define BORDER_W    1
-#define UI_HUD      1        /* HUD overlay                 */
-#define XR_COLORS   1        /* color scheme from Xresources */
-#define ROUND_CORNERS 0      /* rounded window corners      */
-```
-
-Titlebar icon glyphs (Xft symbol strings):
-
-```c
-const FcChar8 *close_sym = (FcChar8 *)"X";
-const FcChar8 *max_sym   = (FcChar8 *)"O";
-```
-
 ## Mouse bindings
 
-| Combination           | Action                                  |
-| --------------------- | ---------------------------------------- |
-| `Mouse`               | focus under cursor                       |
-| `MOD1` + `Left Mouse` | move window                              |
-| `MOD1` + `Right Mouse`| resize window                            |
-| `Mouse wheel` (Press) | move the canvas with the mouse position  |
+| Combination           | Action                                                    |
+| --------------------- | ---------------------------------------------------------- |
+| `Mouse`               | focus under cursor                                         |
+| `Left Mouse` drag     | move window — release mid-motion to *throw* it             |
+| `Right Mouse` drag    | resize window                                              |
+| `Mouse wheel` (Press) | move the canvas with the mouse position                    |
+
+Dragging one window into another pushes the other window away.
 
 ## Keyboard bindings
 
@@ -145,29 +151,15 @@ const FcChar8 *max_sym   = (FcChar8 *)"O";
 | `MOD1` + `f`                     | maximize toggle              |
 | `MOD1` + `c`                     | center window                |
 | `MOD1` + `Shift` + `c`           | kill window                  |
-| `MOD1` + `1-6`                   | desktop swap                 |
-| `MOD1` + `Shift` + `1-6`         | send window to desktop       |
 | `MOD1` + `TAB` (*alt-tab*)       | focus cycle                  |
 | `MOD1` + `Shift` + `Left/Right`  | pan canvas left / right      |
 | `MOD1` + `Shift` + `Up/Down`     | pan canvas up / down         |
 | `MOD1` + `b`                     | toggle minimap               |
 
-> Keybindings come from `config.h` / `config.lua` — the defaults above are
-> just what's shipped. Rebind anything without touching the source.
-
-## Launch & utility bindings
-
-| Combination              | Action        | Program      |
-| ------------------------ | ------------- | ------------ |
-| `MOD4` + `Return`        | terminal      | `st`         |
-| `MOD4` + `p`             | dmenu         | `dmenu_run`  |
-| `MOD4` + `Shift` + `s`   | scrot         | `scr`        |
-| `XF86_AudioLowerVolume`  | volume down   | `amixer`     |
-| `XF86_AudioRaiseVolume`  | volume up     | `amixer`     |
-| `XF86_AudioMute`         | volume toggle | `amixer`     |
-| `XF86_MonBrightnessUp`   | brightness up | `bri`        |
-| `XF86_MonBrightnessDown` | brightness down | `bri`      |
+> Keybindings come from `config.lua` — the defaults above are just what's shipped.
+> Rebind anything without touching the source.
 
 ---
 
-Thank you so much
+*Upstream: [sbcwm](https://github.com/esnokum-dacom/sbpcwm) — all credit for the base
+window manager goes there. Everything physics-related here is experimental fork work.*

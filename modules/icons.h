@@ -1,7 +1,7 @@
 #pragma once
 
 #include "sbcct.h"
-#include "sbcwm.h"
+#include "sbpcwm.h"
 
 void icons_load_state(Config *cfg);
 void icons_rebuild(void);

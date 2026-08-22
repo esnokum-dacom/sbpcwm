@@ -15,7 +15,7 @@
 #include <xcb/shape.h>
 
 #include "sbcct.h"
-#include "sbcwm.h"
+#include "sbpcwm.h"
 #include "icons.h"
 
 #define ICON_SIZE 100
@@ -518,7 +518,7 @@ static void icon_window_create(int i, const LauncherIcon *ic) {
 
     IconImg *img = img_load(ic->image);
     if (!img && ic->image && ic->image[0])
-        fprintf(stderr, "sbcwm: cannot load icon image '%s'\n", ic->image);
+        fprintf(stderr, "sbpcwm: cannot load icon image '%s'\n", ic->image);
     icon_draw(iw, ic, img);
 
     slots[i].iw = iw;
@@ -699,10 +699,10 @@ void icons_save(void) {
 
     FILE *f = fopen(path, "w");
     if (!f) {
-        fprintf(stderr, "sbcwm: cannot write icon state %s\n", path);
+        fprintf(stderr, "sbpcwm: cannot write icon state %s\n", path);
         return;
     }
-    fprintf(f, "-- sbcwm desktop icon state (managed by sbcwm; edit config.lua for defaults)\n");
+    fprintf(f, "-- sbpcwm desktop icon state (managed by sbpcwm; edit config.lua for defaults)\n");
     fprintf(f, "icons = {\n");
     for (int i = 0; i < cfg->nicons; i++) {
         LauncherIcon *ic = &cfg->icons[i];

@@ -23,9 +23,10 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <math.h>
 
 #include "sbcct.h"
-#include "sbcwm.h"
+#include "sbpcwm.h"
 #include "ctl.h"
 #include "icons.h"
 
@@ -262,7 +263,7 @@ XftFont *open_font(const char *name) {
     if (!name || !*name) name = "fixed";
     XftFont *f = XftFontOpenName(dpy, scrno, name);
     if (!f) {
-        fprintf(stderr, "sbcwm: cannot open font '%s', falling back to 'fixed'\n", name);
+        fprintf(stderr, "sbpcwm: cannot open font '%s', falling back to 'fixed'\n", name);
         f = XftFontOpenName(dpy, scrno, "fixed");
     }
     return f;
@@ -914,16 +915,6 @@ void canvas_apply_all(void) {
         if (m < n_mons) {
             int mx = mons[m].x, my = mons[m].y, mw = mons[m].w, mh = mons[m].h;
 
-            if (sx + c->width  <= mx || sx >= mx + mw ||
-                sy + c->height <= my || sy >= my + mh) {
-                uint32_t v[2] = { (uint32_t)(mx - c->width - 8000), (uint32_t)my };
-                xcb_configure_window(conn, c->w, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, v);
-                if (c->titlebar) {
-                    uint32_t tv[2] = { (uint32_t)(mx - c->width - 8000), (uint32_t)(my - TITLEBAR_HEIGHT) };
-                    xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, tv);
-                }
-                continue;
-            }
             apply_mask(c->w, sx, sy, (unsigned)c->width, (unsigned)c->height, wborder(), mx, my, mw, mh);
             if (c->titlebar)
                 apply_mask(c->titlebar, sx, sy - TITLEBAR_HEIGHT, (unsigned)c->width, (unsigned)TB_CONTENT_H, wborder(), mx, my, mw, mh);
@@ -1097,6 +1088,248 @@ void canvas_focus(client *c) {
     win_focus(c);
     titlebar_update(cur);
 }
+
+static long phys_last_ms   = 0;
+static int  phys_dirty     = 0;
+static client *phys_held   = NULL;
+
+#define THROW_SAMPLES 8
+static int16_t th_x[THROW_SAMPLES];
+static int16_t th_y[THROW_SAMPLES];
+static long    th_t[THROW_SAMPLES];
+static int     th_n;
+
+typedef struct { float x0, y0, x1, y1; } PhysBox;
+
+void physics_wake(client *c)  { if (c && !c->f) c->awake = 1; }
+void physics_sleep(client *c) { if (c) { c->vx = 0; c->vy = 0; c->awake = 0; } }
+
+void physics_init(void) { phys_last_ms = now_ms(); }
+
+static void throw_reset(void) { th_n = 0; }
+
+static void throw_sample(int x, int y) {
+    int i = th_n % THROW_SAMPLES;
+    th_x[i] = (int16_t)x;
+    th_y[i] = (int16_t)y;
+    th_t[i] = now_ms();
+    th_n++;
+}
+
+void physics_drag_release(client *c, int px, int py) {
+    if (!c || c->f || !PHYS_ENABLED) return;
+    throw_sample(px, py);
+
+    long   now = th_t[(th_n - 1) % THROW_SAMPLES];
+    int    old = -1;
+    for (int k = 1; k <= th_n && k <= THROW_SAMPLES; k++) {
+        int idx = (th_n - k) % THROW_SAMPLES;
+        if (now - th_t[idx] <= THROW_WINDOW_MS) old = idx;
+        else break;
+    }
+
+    float vx = 0, vy = 0;
+    if (old >= 0 && old != (th_n - 1) % THROW_SAMPLES) {
+        long   dt = now - th_t[old];
+        if (dt > 10) {
+            vx = ((float)(th_x[(th_n-1) % THROW_SAMPLES] - th_x[old]) * 1000.0f / (float)dt) * THROW_BOOST;
+            vy = ((float)(th_y[(th_n-1) % THROW_SAMPLES] - th_y[old]) * 1000.0f / (float)dt) * THROW_BOOST;
+        }
+    }
+
+    float sp = sqrtf(vx*vx + vy*vy);
+    if (sp > PHYS_VMAX) { vx *= PHYS_VMAX/sp; vy *= PHYS_VMAX/sp; }
+
+    if (sp > PHYS_STOP_SPEED) {
+        c->vx = vx;
+        c->vy = vy;
+        c->awake = 1;
+    } else {
+        physics_sleep(c);
+    }
+}
+
+void physics_drag_start(client *c) {
+    phys_held = c;
+    if (!c) return;
+    physics_sleep(c);
+    throw_reset();
+}
+
+static void phys_box(const client *c, PhysBox *b) {
+    unsigned int bw = wborder();
+    int tb = cfg->titlebar ? TITLEBAR_HEIGHT : 0;
+    b->x0 = c->cx - (float)bw;
+    b->y0 = c->cy - (float)tb;
+    b->x1 = c->cx + (float)c->width  + (float)bw;
+    b->y1 = c->cy + (float)c->height + (float)bw;
+}
+
+static float phys_mass(const client *c) {
+    float area = (float)c->width * (float)c->height;
+    return MAX(area, 40000.0f);
+}
+
+static int phys_overlap(const PhysBox *a, const PhysBox *b, float *ox, float *oy) {
+    *ox = MIN(a->x1, b->x1) - MAX(a->x0, b->x0);
+    *oy = MIN(a->y1, b->y1) - MAX(a->y0, b->y0);
+    return (*ox > 0.0f && *oy > 0.0f);
+}
+
+static void phys_resolve(client *a, client *b) {
+    if (a == b || a->f || b->f || a->mon != b->mon || a->mon >= n_mons) return;
+
+    PhysBox ba, bb, *pa = &ba, *pb = &bb;
+    phys_box(a, pa);
+    phys_box(b, pb);
+
+    float ox, oy;
+    if (!phys_overlap(pa, pb, &ox, &oy)) return;
+
+    float ia = (a == phys_held) ? 0.0f : 1.0f / phys_mass(a);
+    float ib = (b == phys_held) ? 0.0f : 1.0f / phys_mass(b);
+    float isum = ia + ib;
+    if (isum <= 0.0f) return;
+
+    float nx = 0, ny = 0, pen;
+    if (ox < oy) {
+        nx  = ((a->cx + a->width * 0.5f) < (b->cx + b->width * 0.5f)) ? -1.0f : 1.0f;
+        pen = ox;
+    } else {
+        ny  = ((a->cy + a->height * 0.5f) < (b->cy + b->height * 0.5f)) ? -1.0f : 1.0f;
+        pen = oy;
+    }
+
+    float corr = MAX(pen - PHYS_SLOP, 0.0f) / isum * PHYS_CORRECT;
+    a->cx += nx * corr * ia;
+    a->cy += ny * corr * ia;
+    b->cx -= nx * corr * ib;
+    b->cy -= ny * corr * ib;
+
+    float rv = (b->vx - a->vx) * nx + (b->vy - a->vy) * ny;
+    if (rv < 0.0f) {
+        float j = -(1.0f + PHYS_RESTITUTION) * rv / isum;
+        a->vx += j * ia * nx;
+        a->vy += j * ia * ny;
+        b->vx -= j * ib * nx;
+        b->vy -= j * ib * ny;
+    }
+
+    if (ia > 0.0f && sqrtf(a->vx*a->vx + a->vy*a->vy) > PHYS_STOP_SPEED) a->awake = 1;
+    if (ib > 0.0f && sqrtf(b->vx*b->vx + b->vy*b->vy) > PHYS_STOP_SPEED) b->awake = 1;
+
+    phys_dirty = 1;
+}
+
+void physics_push_away(client *pusher) {
+    if (!pusher || !PHYS_ENABLED || pusher->f || !list) return;
+
+    static float prev_cx = 0, prev_cy = 0;
+    static long  prev_ms = 0;
+    long  now = now_ms();
+    float vpx = 0, vpy = 0;
+    if (prev_ms && now > prev_ms) {
+        vpx = (pusher->cx - prev_cx) * 1000.0f / (float)(now - prev_ms);
+        vpy = (pusher->cy - prev_cy) * 1000.0f / (float)(now - prev_ms);
+    }
+    prev_cx = pusher->cx;
+    prev_cy = pusher->cy;
+    prev_ms = now;
+    float vspeed = MAX(sqrtf(vpx*vpx + vpy*vpy), 140.0f);
+
+    for win {
+        client *o = c;
+        if (o == pusher || o->f || o->mon != pusher->mon || o->mon >= n_mons) continue;
+
+        PhysBox bp, bo;
+        phys_box(pusher, &bp);
+        phys_box(o, &bo);
+
+        float ox, oy;
+        if (!phys_overlap(&bp, &bo, &ox, &oy)) continue;
+
+        float nx = 0, ny = 0, pen;
+        if (ox < oy) {
+            nx  = ((pusher->cx + pusher->width * 0.5f) < (o->cx + o->width * 0.5f)) ? -1.0f : 1.0f;
+            pen = ox;
+        } else {
+            ny  = ((pusher->cy + pusher->height * 0.5f) < (o->cy + o->height * 0.5f)) ? -1.0f : 1.0f;
+            pen = oy;
+        }
+
+        o->cx += nx * (pen + 2.0f);
+        o->cy += ny * (pen + 2.0f);
+        o->vx  = nx * vspeed;
+        o->vy  = ny * vspeed;
+        o->awake = 1;
+
+        float px = canvas.pan_x[o->mon], py = canvas.pan_y[o->mon];
+        client_move(o, canvas_to_screen(o->cx, px), canvas_to_screen(o->cy, py));
+        phys_dirty = 1;
+    }
+}
+
+static int phys_any_moving(void) {
+    for win
+        if (!c->f && c->awake) return 1;
+    return 0;
+}
+
+static int phys_sleep_ok(const client *me) {
+    PhysBox bc;
+    phys_box(me, &bc);
+    for win {
+        if (c == me || c->f || c->mon != me->mon || c->mon >= n_mons) continue;
+        PhysBox bo;
+        phys_box(c, &bo);
+        float ox, oy;
+        if (phys_overlap(&bc, &bo, &ox, &oy)) return 0;
+    }
+    return 1;
+}
+
+void physics_tick(void) {
+    if (!PHYS_ENABLED) return;
+
+    long now = now_ms();
+    float dt = (now - phys_last_ms) / 1000.0f;
+    phys_last_ms = now;
+    if (dt < 0.0f)   dt = 0.0f;
+    if (dt > 0.05f)  dt = 0.05f;
+    if (!list || !phys_any_moving()) return;
+
+    float damp = expf(-PHYS_FRICTION * dt);
+
+    for win {
+        if (c->f || !c->awake || c == phys_held) continue;
+        c->vx *= damp;
+        c->vy *= damp;
+        float sp = sqrtf(c->vx*c->vx + c->vy*c->vy);
+        if (sp > PHYS_VMAX) { c->vx *= PHYS_VMAX/sp; c->vy *= PHYS_VMAX/sp; }
+        c->cx += c->vx * dt;
+        c->cy += c->vy * dt;
+        phys_dirty = 1;
+    }
+
+    for (client *a = list; a;) {
+        for (client *b = a->next; b && b != list; b = b->next)
+            phys_resolve(a, b);
+        a = (a->next == list) ? NULL : a->next;
+    }
+
+    for win {
+        if (c->f || !c->awake || c == phys_held) continue;
+        float sp = sqrtf(c->vx*c->vx + c->vy*c->vy);
+        if (sp < PHYS_STOP_SPEED && phys_sleep_ok(c))
+            physics_sleep(c);
+    }
+
+    if (phys_dirty) {
+        canvas_apply_all();
+        phys_dirty = 0;
+    }
+}
+
 
 void win_prev(const Arg arg) {
     (void)arg;
@@ -1281,6 +1514,8 @@ void notify_motion(xcb_motion_notify_event_t *e) {
     int yd = e->root_y - drag_root_y;
  
     if (drag_button == XCB_BUTTON_INDEX_1) {
+        throw_sample(e->root_x, e->root_y);
+
         int new_sx = cur->wx + xd;
         int new_sy = cur->wy + yd;
  
@@ -1308,6 +1543,8 @@ void notify_motion(xcb_motion_notify_event_t *e) {
         int m = cur->mon;
         cur->cx = (float)new_sx + canvas.pan_x[m];
         cur->cy = (float)new_sy + canvas.pan_y[m];
+
+        physics_push_away(cur);
     } else if (drag_button == XCB_BUTTON_INDEX_3) {
         client_resize(cur, (unsigned)MAX(1, (int)cur->ww + xd), (unsigned)MAX(1, (int)cur->wh + yd));
     }
@@ -1327,6 +1564,15 @@ void key_press(xcb_key_press_event_t *e) {
             return;
         }
     }
+}
+
+static void begin_pointer_grab(void) {
+    xcb_grab_pointer_cookie_t gck = xcb_grab_pointer(conn, 0, root,
+        XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_BUTTON_PRESS |
+        XCB_EVENT_MASK_BUTTON_RELEASE,
+        XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_NONE, XCB_NONE, XCB_CURRENT_TIME);
+    xcb_grab_pointer_reply_t *gr = xcb_grab_pointer_reply(conn, gck, NULL);
+    if (gr) free(gr);
 }
 
 void button_press(xcb_button_press_event_t *gen_e) {
@@ -1390,6 +1636,8 @@ void button_press(xcb_button_press_event_t *gen_e) {
         drag_button = e->detail;
         drag_root_x = e->root_x;
         drag_root_y = e->root_y;
+        begin_pointer_grab();
+        physics_drag_start(c);
  
         uint32_t stack = XCB_STACK_MODE_ABOVE;
         xcb_configure_window(conn, c->w, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
@@ -1424,6 +1672,11 @@ void button_press(xcb_button_press_event_t *gen_e) {
     drag_button = e->detail;
     drag_root_x = e->root_x;
     drag_root_y = e->root_y;
+
+    client *held = NULL;
+    for win if (c->w == e->child || c->titlebar == e->child) { held = c; break; }
+    begin_pointer_grab();
+    physics_drag_start(held);
  
     xcb_flush(conn);
 }
@@ -1431,7 +1684,17 @@ void button_press(xcb_button_press_event_t *gen_e) {
 void button_release(xcb_button_release_event_t *e) {
     if (icon_handle_release(e)) return;
     if (pan_active) pan_active = 0;
+
+    if (drag_subwindow && drag_button == XCB_BUTTON_INDEX_1) {
+        client *dc = NULL;
+        for win if (c->w == drag_subwindow) dc = c;
+        if (dc) physics_drag_release(dc, e->root_x, e->root_y);
+    }
+
+    phys_held   = NULL;
     drag_subwindow = 0;
+    xcb_ungrab_pointer(conn, XCB_CURRENT_TIME);
+    xcb_flush(conn);
 }
 
 void win_add(xcb_window_t w) {
@@ -1475,7 +1738,13 @@ void win_del(xcb_window_t w) {
     client *x = NULL;
     for win if (c->w == w) x = c;
     if (!list || !x) return;
-    
+
+    if (phys_held == x) {
+        phys_held = NULL;
+        drag_subwindow = 0;
+        xcb_ungrab_pointer(conn, XCB_CURRENT_TIME);
+    }
+
     if (x->titlebar) titlebar_del(x);
     
     if (x->prev == x) list = NULL;
@@ -1544,6 +1813,91 @@ void win_center(const Arg arg) {
     int m = cur->mon;
     cur->cx = (float)sx + canvas.pan_x[m];
     cur->cy = (float)sy + canvas.pan_y[m];
+    minimap_update();
+}
+
+static int spawn_spot_free(const client *skip, int sx, int sy, unsigned int ww, unsigned int wh) {
+    unsigned int bw = wborder();
+    int tb = cfg->titlebar ? TITLEBAR_HEIGHT : 0;
+
+    int ax0 = sx - (int)bw - 1,          ay0 = sy - tb - (int)bw - 1;
+    int ax1 = sx + (int)ww + (int)bw + 1, ay1 = sy + (int)wh + (int)bw + 1;
+
+    for win {
+        if (c == skip || c->f || !c->width || !c->height) continue;
+        int bx0 = c->x - (int)bw,             by0 = c->y - tb;
+        int bx1 = c->x + c->width + (int)bw,  by1 = c->y + c->height + (int)bw;
+        if (ax0 < bx1 && ax1 > bx0 && ay0 < by1 && ay1 > by0) return 0;
+    }
+    return 1;
+}
+
+static int spawn_search_rings(const client *skip, int bx, int by,
+                              unsigned int ww, unsigned int wh, int require_inside,
+                              int mx, int my, int mw, int mh, int *ox, int *oy) {
+    unsigned int bw = wborder();
+    int bwi = (int)bw;
+    int tw = (int)ww + 2 * (int)bw;
+    int th = (int)wh + 2 * (int)bw + wborder();
+
+    for (int r = 1; r <= SPAWN_SEARCH_MAX; r++) {
+        for (int t = -r; t <= r; t++) {
+            int cand[4][2] = {
+                { bx + r * SPAWN_SEARCH_STEP, by + t * SPAWN_SEARCH_STEP },
+                { bx - r * SPAWN_SEARCH_STEP, by + t * SPAWN_SEARCH_STEP },
+                { bx + t * SPAWN_SEARCH_STEP, by + r * SPAWN_SEARCH_STEP },
+                { bx + t * SPAWN_SEARCH_STEP, by - r * SPAWN_SEARCH_STEP },
+            };
+            for (int k = 0; k < 4; k++) {
+                int sx = cand[k][0], sy = cand[k][1];
+                if (require_inside &&
+                    (sx < mx + bwi || sx > mx + mw - tw ||
+                     sy < my + bwi || sy > my + mh - th))
+                    continue;
+                if (spawn_spot_free(skip, sx, sy, ww, wh)) { *ox = sx; *oy = sy; return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+void win_place_free(client *c) {
+    if (!c || c->f) return;
+
+    unsigned int ww_, wh_;
+    win_size(c->w, NULL, NULL, &ww_, &wh_);
+
+    xcb_query_pointer_reply_t *ptr = xcb_query_pointer_reply(conn, xcb_query_pointer(conn, root), NULL);
+    int mx = 0, my = 0, mw = sw, mh = sh;
+    if (ptr) {
+        int m = mon_from_point(ptr->root_x, ptr->root_y);
+        if (m < n_mons) { mx = mons[m].x; my = mons[m].y; mw = mons[m].w; mh = mons[m].h; }
+        free(ptr);
+    }
+
+    unsigned int bw = wborder();
+    int tw = (int)ww_ + 2 * (int)bw;
+    int th = (int)wh_ + 2 * (int)bw + wborder();
+
+    int bx = mx + (mw - tw) / 2;
+    int by = my + (mh - th) / 2;
+
+    int fx = bx, fy = by;
+
+    if (!spawn_spot_free(c, bx, by, ww_, wh_)) {
+        if (!spawn_search_rings(c, bx, by, ww_, wh_, 1, mx, my, mw, mh, &fx, &fy) &&
+            !spawn_search_rings(c, bx, by, ww_, wh_, 0, 0, 0, 0, 0, &fx, &fy)) {
+            fx = bx + (SPAWN_SEARCH_MAX + 1) * SPAWN_SEARCH_STEP;
+            fy = by + (SPAWN_SEARCH_MAX + 1) * SPAWN_SEARCH_STEP;
+        }
+    }
+
+    client_move(c, fx, fy);
+
+    set_client_monitor(c, mon_at_win(c->w));
+    int m = c->mon;
+    c->cx = (float)fx + canvas.pan_x[m];
+    c->cy = (float)fy + canvas.pan_y[m];
     minimap_update();
 }
 
@@ -1810,10 +2164,10 @@ void map_request(xcb_map_request_event_t *e) {
             int cy = py + ((int)ph - (int)nh) / 2;
             client_move(cur, cx, cy);
         } else if (nx + ny == 0) {
-            win_center((Arg){0});
+            win_place_free(cur);
         }
     } else if (nx + ny == 0) {
-        win_center((Arg){0});
+        win_place_free(cur);
     }
  
  
@@ -1908,7 +2262,7 @@ void reload_config(const Arg arg) {
 
     Config *new_cfg = config_load(cfgdir);
     if (!new_cfg) {
-        fprintf(stderr, "sbcwm: failed to reload config\n");
+        fprintf(stderr, "sbpcwm: failed to reload config\n");
         notify_show("Config failed", 0x202020);
         return;
     }
@@ -2150,7 +2504,7 @@ int main(void) {
     xcb_change_property(conn, XCB_PROP_MODE_REPLACE, wmcheck, net_supporting_wm_check,
                          XCB_ATOM_WINDOW, 32, 1, &wmcheck);
     xcb_change_property(conn, XCB_PROP_MODE_REPLACE, wmcheck, net_wm_name,
-                         ewmh_utf8_string, 8, 6, "sbcwm");
+                         ewmh_utf8_string, 8, 6, "sbpcwm");
  
     xcb_atom_t supported[] = {
         net_supporting_wm_check, net_wm_name, net_wm_window_type,
@@ -2186,7 +2540,7 @@ int main(void) {
     cfg = config_load(cfgdir);
 
     if (!cfg) {
-	fprintf(stderr, "sbcwm: failed to load config, exiting\n");
+	fprintf(stderr, "sbpcwm: failed to load config, exiting\n");
 	exit(1);
     }
 
@@ -2213,6 +2567,8 @@ int main(void) {
 
     ctl_init();
 
+    physics_init();
+
     int xfd = xcb_get_file_descriptor(conn);
     while (running) {
         struct pollfd pfds[2];
@@ -2223,7 +2579,7 @@ int main(void) {
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
 
-        int pr = poll(pfds, pfds[1].fd >= 0 ? 2 : 1, 50);
+        int pr = poll(pfds, pfds[1].fd >= 0 ? 2 : 1, 16);
         if (pr < 0) {
             if (errno == EINTR) continue;
             break;
@@ -2239,6 +2595,7 @@ int main(void) {
             if (xcb_connection_has_error(conn)) break;
         }
 
+        physics_tick();
         notify_cleanup();
     }
 

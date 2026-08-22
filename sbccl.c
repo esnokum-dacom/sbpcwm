@@ -80,7 +80,7 @@ static void build_key(lua_State *L, int idx, struct key *k) {
     lua_getfield(L, idx, "func");
     k->function = func_from_name(lua_tostring(L, -1));
     if (!k->function)
-	fprintf(stderr, "sbcwm: unknown func '%s' in config.lua\n", lua_tostring(L, -1));
+	fprintf(stderr, "sbpcwm: unknown func '%s' in config.lua\n", lua_tostring(L, -1));
     lua_pop(L, 1);
 
     Arg a = {0};
@@ -274,7 +274,7 @@ Config *config_load(const char *path) {
             lua_getfield(L, idx, "func");
             item->function = func_from_name(lua_tostring(L, -1));
             if (!item->function)
-                fprintf(stderr, "sbcwm: unknown func '%s' in config.lua ctx\n", lua_tostring(L, -1));
+                fprintf(stderr, "sbpcwm: unknown func '%s' in config.lua ctx\n", lua_tostring(L, -1));
             lua_pop(L, 1);
 
             Arg a = {0};

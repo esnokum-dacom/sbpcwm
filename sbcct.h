@@ -7,7 +7,7 @@
 #include <xcb/xcb.h>
 #include <xcb/xcb_keysyms.h>
 
-#include "sbcwm.h"
+#include "sbpcwm.h"
 
 struct key {
     unsigned int  mod;

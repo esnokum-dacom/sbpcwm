@@ -14,7 +14,7 @@
 #include <X11/keysym.h>
 
 #include "sbcct.h"
-#include "sbcwm.h"
+#include "sbpcwm.h"
 #include "ctl.h"
 
 static int listen_fd = -1;

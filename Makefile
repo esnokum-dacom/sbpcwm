@@ -6,27 +6,27 @@ PREFIX ?= /usr
 BINDIR ?= $(PREFIX)/bin
 CC     ?= gcc
 
-SRC = sbcwm.c sbccl.c modules/ctl.c modules/ctl_path.c modules/icons.c
+SRC = sbpcwm.c sbccl.c modules/ctl.c modules/ctl_path.c modules/icons.c
 
-all: sbcwm sbcwmctl
+all: sbpcwm sbpcwmctl
 
-sbcwm: $(SRC) sbcwm.h sbcct.h modules/ctl.h modules/icons.h Makefile
-	$(CC) -O3 $(CFLAGS) -o sbcwm $(SRC) $(CLIBS) $(LDFLAGS)
+sbpcwm: $(SRC) sbpcwm.h sbcct.h modules/ctl.h modules/icons.h Makefile
+	$(CC) -O3 $(CFLAGS) -o sbpcwm $(SRC) $(CLIBS) $(LDFLAGS)
 
-sbcwmctl: modules/sbcwmctl.c modules/ctl_path.c modules/ctl.h Makefile
-	$(CC) -O3 $(CFLAGS) -o sbcwmctl modules/sbcwmctl.c modules/ctl_path.c
+sbpcwmctl: modules/sbpcwmctl.c modules/ctl_path.c modules/ctl.h Makefile
+	$(CC) -O3 $(CFLAGS) -o sbpcwmctl modules/sbpcwmctl.c modules/ctl_path.c
 
 install: all
-	install -Dm755 sbcwm $(DESTDIR)$(BINDIR)/sbcwm
-	install -Dm755 sbcwmctl $(DESTDIR)$(BINDIR)/sbcwmctl
-	mkdir -p ~/.config/sbcwm
-	cp ./config.lua ~/.config/sbcwm
+	install -Dm755 sbpcwm $(DESTDIR)$(BINDIR)/sbpcwm
+	install -Dm755 sbpcwmctl $(DESTDIR)$(BINDIR)/sbpcwmctl
+	mkdir -p ~/.config/sbpcwm
+	cp ./config.lua ~/.config/sbpcwm
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/sbcwm
-	rm -f $(DESTDIR)$(BINDIR)/sbcwmctl
+	rm -f $(DESTDIR)$(BINDIR)/sbpcwm
+	rm -f $(DESTDIR)$(BINDIR)/sbpcwmctl
 
 clean:
-	rm -f sbcwm sbcwmctl *.o modules/*.o
+	rm -f sbpcwm sbpcwmctl *.o modules/*.o
 
 .PHONY: all install uninstall clean

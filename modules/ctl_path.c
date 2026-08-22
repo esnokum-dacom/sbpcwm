@@ -21,17 +21,17 @@ const char *ctl_socket_path(char *buf, size_t n) {
         d[i] = 0;
         const char *rt = getenv("XDG_RUNTIME_DIR");
         if (rt && *rt)
-            snprintf(buf, n, "%s/sbcwm-%s.sock", rt, d);
+            snprintf(buf, n, "%s/sbpcwm-%s.sock", rt, d);
         else
-            snprintf(buf, n, "/tmp/sbcwm-%ld-%s.sock", (long)getuid(), d);
+            snprintf(buf, n, "/tmp/sbpcwm-%ld-%s.sock", (long)getuid(), d);
         return buf;
     }
 
     const char *rt = getenv("XDG_RUNTIME_DIR");
     if (rt && *rt) {
-        snprintf(buf, n, "%s/sbcwm.sock", rt);
+        snprintf(buf, n, "%s/sbpcwm.sock", rt);
         return buf;
     }
-    snprintf(buf, n, "/tmp/sbcwm-%ld.sock", (long)getuid());
+    snprintf(buf, n, "/tmp/sbpcwm-%ld.sock", (long)getuid());
     return buf;
 }

@@ -14,6 +14,17 @@ struct Config;
 #define SPAWN_SEARCH_STEP 30
 #define SPAWN_SEARCH_MAX  40
 
+/* Physics (window <-> window collisions) */
+#define PHYS_ENABLED      1     /* master switch */
+#define PHYS_RESTITUTION  0.55f /* bounciness of window-window hits (0..1) */
+#define PHYS_FRICTION     4.0f  /* exponential damping per second */
+#define PHYS_STOP_SPEED   8.0f  /* px/s below which a window goes back to sleep */
+#define PHYS_VMAX         3200.0f /* clamp so nothing teleports */
+#define PHYS_SLOP         0.5f  /* allowed penetration before separation (px) */
+#define PHYS_CORRECT      0.8f  /* fraction of penetration corrected per tick */
+#define THROW_WINDOW_MS   120   /* pointer history window for throw velocity */
+#define THROW_BOOST       1.15f /* multiplier applied to release flick speed */
+
 #define win (client *t = 0, *c = list; c && t != list->prev; t = c, c = c->next)
 
 #define canvas_to_screen(val, pan) (int)(((val) - (pan)))
@@ -51,6 +62,8 @@ typedef struct client {
   int basew, baseh, incw, inch, maxw, maxh, minw, minh;
   float mina, maxa;
   float cx, cy;
+  float vx, vy;
+  unsigned char awake;
 } client;
 
 typedef struct {
@@ -138,6 +151,15 @@ void canvas_apply_all(void);
 void apply_mask(xcb_window_t w, int wx, int wy, unsigned int ww, unsigned int wh, int bw,
                  int mx, int my, int mw, int mh);
 void canvas_focus(client *c);
+
+void physics_init(void);
+void physics_tick(void);
+void physics_wake(client *c);
+void physics_sleep(client *c);
+void physics_drag_start(client *c);
+void physics_drag_release(client *c, int pointer_x, int pointer_y);
+void physics_push_away(client *pusher);
+void win_place_free(client *c);
 
 void hud_update(void);
 
