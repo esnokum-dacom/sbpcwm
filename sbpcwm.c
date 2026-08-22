@@ -427,40 +427,101 @@ int is_titlebar(xcb_window_t w) {
     return client_from_titlebar(w) != NULL;
 }
 
-void apply_mask(xcb_window_t w, int wx, int wy, unsigned int ww, unsigned int wh, int bw,
-                 int mx, int my, int mw, int mh) {
+typedef struct { int16_t x, y; uint16_t w, h; } ClipRect;
+
+#define CLIP_MAX_PIECES 64
+
+/* piece minus monitor rect -> up to 4 remainder strips.
+   Returns -1 when disjoint (nothing to do), 0 when fully swallowed. */
+static int clip_subtract_mon(const ClipRect *p, const MonitorInfo *m, ClipRect *out) {
+    int n = 0;
+    int px0 = p->x,        py0 = p->y;
+    int px1 = p->x + p->w, py1 = p->y + p->h;
+    int bx0 = m->x,        by0 = m->y;
+    int bx1 = m->x + m->w, by1 = m->y + m->h;
+
+    if (px0 >= bx1 || px1 <= bx0 || py0 >= by1 || py1 <= by0) return -1;
+
+    if (px0 < bx0) {
+        out[n].x = px0; out[n].y = py0; out[n].w = (uint16_t)(bx0 - px0); out[n].h = (uint16_t)(py1 - py0); n++;
+    }
+    if (px1 > bx1) {
+        out[n].x = bx1; out[n].y = py0; out[n].w = (uint16_t)(px1 - bx1); out[n].h = (uint16_t)(py1 - py0); n++;
+    }
+    int mx0 = MAX(px0, bx0), mx1 = MIN(px1, bx1);
+    if (mx1 > mx0) {
+        if (py0 < by0) {
+            out[n].x = mx0; out[n].y = py0; out[n].w = (uint16_t)(mx1 - mx0); out[n].h = (uint16_t)(by0 - py0); n++;
+        }
+        if (py1 > by1) {
+            out[n].x = mx0; out[n].y = by1; out[n].w = (uint16_t)(mx1 - mx0); out[n].h = (uint16_t)(py1 - by1); n++;
+        }
+    }
+    return n;
+}
+
+/* Shape a frame to itself minus every monitor except own_mon: clients may roam
+   the whole canvas, but can never render or take input over another monitor. */
+static void canvas_shape(xcb_window_t w, const ClipRect *frame, int own_mon) {
     if (!w) return;
 
-    int ox0 = wx,                   oy0 = wy;
-    int ox1 = wx + (int)ww + 2*bw,  oy1 = wy + (int)wh + 2*bw;
+    static ClipRect a[CLIP_MAX_PIECES], b[CLIP_MAX_PIECES];
+    int na = 1, subbed = 0;
+    a[0] = *frame;
 
-    int clip_l = ox0 < mx;
-    int clip_r = ox1 > mx + mw;
-    int clip_t = oy0 < my;
-    int clip_b = oy1 > my + mh;
+    for (int m = 0; m < n_mons && na; m++) {
+        if (m == own_mon) continue;
+        int nb = 0;
+        for (int i = 0; i < na && nb < CLIP_MAX_PIECES - 4; i++) {
+            ClipRect rem[4];
+            int k = clip_subtract_mon(&a[i], &mons[m], rem);
+            if (k < 0) b[nb++] = a[i];               /* disjoint: keep */
+            else { subbed = 1;                        /* k == 0 -> swallowed: drop */
+                   for (int j = 0; j < k; j++) b[nb++] = rem[j]; }
+        }
+        memcpy(a, b, (size_t)nb * sizeof(ClipRect));
+        na = nb;
+    }
 
-    if (!clip_l && !clip_r && !clip_t && !clip_b) {
+    if (!subbed) {
         xcb_shape_mask(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING, w, 0, 0, XCB_PIXMAP_NONE);
         return;
     }
 
-    int left   = clip_l ? mx        : ox0;
-    int right  = clip_r ? mx + mw   : ox1;
-    int top    = clip_t ? my        : oy0;
-    int bottom = clip_b ? my + mh   : oy1;
+    xcb_rectangle_t rects[CLIP_MAX_PIECES];
+    int nr = 0;
+    for (int i = 0; i < na; i++) {
+        if (!a[i].w || !a[i].h) continue;
+        rects[nr].x      = (int16_t)(a[i].x - frame->x);
+        rects[nr].y      = (int16_t)(a[i].y - frame->y);
+        rects[nr].width  = a[i].w;
+        rects[nr].height = a[i].h;
+        nr++;
+    }
 
-    int rw = right  - left;
-    int rh = bottom - top;
-
-    if (rw > 0 && rh > 0) {
-        xcb_rectangle_t rect = {
-            .x = (int16_t)(left - wx - bw), .y = (int16_t)(top - wy - bw),
-            .width = (uint16_t)rw, .height = (uint16_t)rh,
-        };
+    if (nr == 0) {
+        /* fully covered by other monitors: empty region -> hidden, no input */
+        xcb_rectangle_t none = { 0, 0, 0, 0 };
         xcb_shape_rectangles(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING,
-                              XCB_CLIP_ORDERING_UNSORTED, w, 0, 0, 1, &rect);
+                             XCB_CLIP_ORDERING_UNSORTED, w, 0, 0, 1, &none);
     } else {
-        xcb_shape_mask(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING, w, 0, 0, XCB_PIXMAP_NONE);
+        xcb_shape_rectangles(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING,
+                             XCB_CLIP_ORDERING_UNSORTED, w, 0, 0, (unsigned)nr, rects);
+    }
+}
+
+static void canvas_clip_client(client *c, int sx, int sy) {
+    unsigned int bw = wborder();
+    int wb2 = 2 * (int)bw;
+
+    ClipRect wf = { (int16_t)sx, (int16_t)sy,
+                    (uint16_t)(c->width + wb2), (uint16_t)(c->height + wb2) };
+    canvas_shape(c->w, &wf, c->mon);
+
+    if (c->titlebar) {
+        ClipRect tf = { (int16_t)sx, (int16_t)(sy - TITLEBAR_HEIGHT),
+                        (uint16_t)(c->width + wb2), (uint16_t)TB_CONTENT_H };
+        canvas_shape(c->titlebar, &tf, c->mon);
     }
 }
 
@@ -494,12 +555,7 @@ void client_move(client *c, int x, int y) {
         xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE, sv);
     }
 
-    if (c->mon < n_mons) {
-        int mx = mons[c->mon].x, my = mons[c->mon].y, mw = mons[c->mon].w, mh = mons[c->mon].h;
-        apply_mask(c->w, x, y, (unsigned)c->width, (unsigned)c->height, wborder(), mx, my, mw, mh);
-        if (c->titlebar)
-            apply_mask(c->titlebar, x, y - TITLEBAR_HEIGHT, (unsigned)c->width, TB_CONTENT_H, wborder(), mx, my, mw, mh);
-    }
+    canvas_clip_client(c, x, y);
 
     docks_raise();
     xcb_flush(conn);
@@ -589,12 +645,7 @@ void resizeclient(client *c, int w, int h) {
         uint32_t tv[2] = { (uint32_t)w, TITLEBAR_HEIGHT };
         xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, tv);
     }
-    if (c->mon < n_mons) {
-        int mx = mons[c->mon].x, my = mons[c->mon].y, mw = mons[c->mon].w, mh = mons[c->mon].h;
-        apply_mask(c->w, c->x, c->y, (unsigned)c->width, (unsigned)c->height, wborder(), mx, my, mw, mh);
-        if (c->titlebar)
-            apply_mask(c->titlebar, c->x, c->y - TITLEBAR_HEIGHT, (unsigned)c->width, TB_CONTENT_H, wborder(), mx, my, mw, mh);
-    }
+    canvas_clip_client(c, c->x, c->y);
     xcb_flush(conn);
 }
 
@@ -716,13 +767,7 @@ void canvas_apply_all(void) {
         int sx = canvas_to_screen(c->cx, px);
         int sy = canvas_to_screen(c->cy, py);
 
-        if (m < n_mons) {
-            int mx = mons[m].x, my = mons[m].y, mw = mons[m].w, mh = mons[m].h;
-
-            apply_mask(c->w, sx, sy, (unsigned)c->width, (unsigned)c->height, wborder(), mx, my, mw, mh);
-            if (c->titlebar)
-                apply_mask(c->titlebar, sx, sy - TITLEBAR_HEIGHT, (unsigned)c->width, (unsigned)TB_CONTENT_H, wborder(), mx, my, mw, mh);
-        }
+        canvas_clip_client(c, sx, sy);
 
         client_move(c, sx, sy);
     }

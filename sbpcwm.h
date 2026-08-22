@@ -148,8 +148,6 @@ void canvas_pan(int mon, float dx, float dy);
 void canvas_pan_key(const Arg arg);
 void canvas_reset(const Arg arg);
 void canvas_apply_all(void);
-void apply_mask(xcb_window_t w, int wx, int wy, unsigned int ww, unsigned int wh, int bw,
-                 int mx, int my, int mw, int mh);
 void canvas_focus(client *c);
 
 void physics_init(void);
