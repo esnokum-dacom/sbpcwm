@@ -1,7 +1,7 @@
 CFLAGS += -std=c99 -Wall -Wextra -pedantic -Wold-style-declaration
 CFLAGS += -Wmissing-prototypes -Wno-unused-parameter
 CFLAGS += -I. -Imodules
-CLIBS  += -lX11 -lXext -lXrender -lXinerama -lm -lXft -lpng16 -ljpeg $(shell pkg-config --cflags --libs xft xcb xcb-randr xcb-shape xcb-icccm xcb-keysyms xcb-util x11-xcb lua5.3)
+CLIBS  += -lX11 -lXext -lXrender -lXinerama -lm -lXft -lpng16 -ljpeg $(shell pkg-config --cflags --libs xft xcb xcb-xfixes xcb-randr xcb-shape xcb-icccm xcb-keysyms xcb-util x11-xcb lua5.3)
 PREFIX ?= /usr
 BINDIR ?= $(PREFIX)/bin
 CC     ?= gcc
