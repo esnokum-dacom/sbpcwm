@@ -16,6 +16,7 @@
 #include "sbcct.h"
 #include "sbpcwm.h"
 #include "ctl.h"
+#include "sbcs/sbcs.h"
 
 static int listen_fd = -1;
 
@@ -81,45 +82,51 @@ static const char *next_tok(const char *s, char *out, size_t n) {
 
 typedef enum { OPT_INT, OPT_STR } OptType;
 
-typedef struct {
-    const char *name;
-    OptType type;
-    size_t  field;
-    size_t  size;
-    void (*apply)(void);
-} CtlOpt;
-
 static void apply_none(void) {}
 static void apply_borders(void) { update_border_widths(); }
+static void apply_titlebar_opt(void) { apply_titlebars(); }
 static void apply_fonts(void) { fonts_reload(); canvas_apply_all(); }
-static void apply_visual(void) { canvas_apply_all(); }
 
 #define NUMO(name, applyfn) \
-    { #name, OPT_INT, offsetof(Config, name), sizeof(((Config *)0)->name), applyfn }
+    { #name, NULL, CTL_OPT_INT, offsetof(Config, name), sizeof(((Config *)0)->name), applyfn }
+#define BOOLO(name, applyfn) \
+    { #name, NULL, CTL_OPT_BOOL, offsetof(Config, name), sizeof(((Config *)0)->name), applyfn }
 #define STRO(name, applyfn) \
-    { #name, OPT_STR, offsetof(Config, name), 0, applyfn }
+    { #name, NULL, CTL_OPT_STR, offsetof(Config, name), 0, applyfn }
+#define STROL(label, name, applyfn) \
+    { #name, label, CTL_OPT_STR, offsetof(Config, name), 0, applyfn }
 
 static CtlOpt opts[] = {
-    NUMO(pan_step,     apply_none),
-    NUMO(titlebar,     apply_none),
-    NUMO(ui,           apply_none),
-    NUMO(xr_colors,    apply_visual),
-    NUMO(border,       apply_borders),
-    NUMO(border_width, apply_borders),
-    STRO(ctxbg,        apply_none),
-    STRO(ctxborder,    apply_none),
-    STRO(fonts,        apply_fonts),
-    STRO(fontb,        apply_fonts),
-    STRO(defaultsh,    apply_none),
+    NUMO(pan_step,      apply_none),
+    BOOLO(titlebar,     apply_titlebar_opt),
+    BOOLO(focus_follow, apply_none),
+    BOOLO(border,       apply_borders),
+    NUMO(border_width,  apply_borders),
+    STRO(ctxbg,         apply_colors),
+    STRO(ctxborder,     apply_colors),
+    STROL("Decorations Color", deco, apply_colors),
+    STRO(fonts,         apply_fonts),
+    STRO(fontb,         apply_fonts),
+    STRO(defaultsh,     apply_none),
 };
 
-static CtlOpt *find_opt(const char *name) {
+const char *ctl_opt_label(const CtlOpt *o) {
+    if (!o) return "";
+    return (o->label && o->label[0]) ? o->label : o->name;
+}
+
+const CtlOpt *ctl_find_opt(const char *name) {
     for (size_t i = 0; i < sizeof opts / sizeof *opts; i++)
         if (!strcmp(opts[i].name, name)) return &opts[i];
     return NULL;
 }
 
-static void *opt_ptr(CtlOpt *o) { return (char *)cfg + o->field; }
+const CtlOpt *ctl_opt_list(size_t *n) {
+    if (n) *n = sizeof opts / sizeof *opts;
+    return opts;
+}
+
+static void *opt_ptr(const CtlOpt *o) { return (char *)cfg + o->field; }
 
 static int get_num(const void *p, size_t sz) {
     if (sz == 1) return *(const uint8_t *)p;
@@ -133,15 +140,36 @@ static void set_num(void *p, size_t sz, int v) {
     else              *(int *)p      = v;
 }
 
-static void ctl_get(const char *name, char *reply, size_t n) {
-    CtlOpt *o = find_opt(name);
-    if (!o) { snprintf(reply, n, "ERR unknown option: %s", name); return; }
-    if (o->type == OPT_INT)
-        snprintf(reply, n, "OK %s=%d", o->name, get_num(opt_ptr(o), o->size));
-    else {
-        const char *v = *(char **)opt_ptr(o);
-        snprintf(reply, n, "OK %s=%s", o->name, v ? v : "");
+int ctl_opt_get(const CtlOpt *o, char *buf, size_t n) {
+    if (!o) return -1;
+    if (o->type != CTL_OPT_STR)
+        return snprintf(buf, n, "%d", get_num(opt_ptr(o), o->size));
+    const char *v = *(char **)opt_ptr(o);
+    return snprintf(buf, n, "%s", v ? v : "");
+}
+
+int ctl_opt_set(const CtlOpt *o, const char *value) {
+    if (!o) return -1;
+    if (o->type != CTL_OPT_STR) {
+        char *end = NULL;
+        long v = strtol(value, &end, 10);
+        if (!value[0] || (end && *end)) return -1;
+        set_num(opt_ptr(o), o->size, (int)v);
+    } else {
+        char **dst = (char **)opt_ptr(o);
+        free(*dst);
+        *dst = strdup(value);
     }
+    if (o->apply) o->apply();
+    return 0;
+}
+
+static void ctl_get(const char *name, char *reply, size_t n) {
+    const CtlOpt *o = ctl_find_opt(name);
+    if (!o) { snprintf(reply, n, "ERR unknown option: %s", name); return; }
+    char val[512];
+    ctl_opt_get(o, val, sizeof val);
+    snprintf(reply, n, "OK %s=%s", o->name, val);
 }
 
 static void ctl_set(const char *args, char *reply, size_t n) {
@@ -149,23 +177,14 @@ static void ctl_set(const char *args, char *reply, size_t n) {
     args = next_tok(args, name, sizeof name);
     next_tok(args, value, sizeof value);
 
-    CtlOpt *o = find_opt(name);
+    const CtlOpt *o = ctl_find_opt(name);
     if (!o) { snprintf(reply, n, "ERR unknown option: %s", name); return; }
 
-    if (o->type == OPT_INT) {
-        char *end = NULL;
-        long v = strtol(value, &end, 10);
-        if (!value[0] || (end && *end)) {
-            snprintf(reply, n, "ERR invalid integer: %s", value);
-            return;
-        }
-        set_num(opt_ptr(o), o->size, (int)v);
-    } else {
-        char **dst = (char **)opt_ptr(o);
-        free(*dst);
-        *dst = strdup(value);
+    if (ctl_opt_set(o, value) < 0) {
+        snprintf(reply, n, "ERR invalid integer: %s", value);
+        return;
     }
-    o->apply();
+    sbcs_refresh();
     snprintf(reply, n, "OK %s=%s", o->name, value);
 }
 
@@ -309,6 +328,9 @@ void ctl_handle(int fd, const char *line) {
     else if (!strcmp(cmd, "reload")) {
         reload_config((Arg){0});
         snprintf(reply, sizeof reply, "OK reloaded");
+    } else if (!strcmp(cmd, "settings")) {
+        sbcs_open();
+        snprintf(reply, sizeof reply, "OK settings");
     } else if (!strcmp(cmd, "options")) {
         ctl_options(reply, sizeof reply);
     } else if (!strcmp(cmd, "shortcut") || !strcmp(cmd, "icons")) {
@@ -334,7 +356,9 @@ void ctl_handle(int fd, const char *line) {
         snprintf(reply, sizeof reply, "ERR unknown command: %s", cmd);
     }
 
-    write(fd, reply, strlen(reply));
+    size_t len = strlen(reply);
+    if (len && reply[len - 1] != '\n' && len + 1 < sizeof reply) reply[len++] = '\n';
+    write(fd, reply, len);
 }
 
 void ctl_accept(void) {

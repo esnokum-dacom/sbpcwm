@@ -28,6 +28,7 @@
 
 #include "sbcct.h"
 #include "sbpcwm.h"
+#include "sbcs/sbcs.h"
 #include "ctl.h"
 #include "icons.h"
 
@@ -38,6 +39,16 @@ const FcChar8 *max_sym = (FcChar8 *)"Λ";
 
 static client *list = NULL;
 static client *cur  = NULL;
+
+static int shape_ok = 0;
+
+static int      layout_dirty = 0;
+static int      drag_dirty   = 0;
+static client  *drag_c       = NULL;
+static int      drag_tx = 0, drag_ty = 0;
+static int      resize_dirty = 0;
+static unsigned resize_tw = 0, resize_th = 0;
+static long     frame_last_ms = 0;
 
 static XftFont *title_font  = NULL;
 static XftFont *button_font = NULL;
@@ -164,7 +175,6 @@ Config *cfg;
 
 static uint32_t wborder(void) { return cfg->border ? cfg->border_width : 0; }
 
-#define TB_CONTENT_H (TITLEBAR_HEIGHT - 2 * wborder())
 
 static long now_ms(void) {
     struct timespec t_s;
@@ -187,7 +197,7 @@ const char *get_home(void) {
     return pw ? pw->pw_dir : NULL;
 }
 
-static xcb_atom_t get_atom(const char *name) {
+xcb_atom_t get_atom(const char *name) {
     xcb_intern_atom_cookie_t ck = xcb_intern_atom(conn, 0, (uint16_t)strlen(name), name);
     xcb_intern_atom_reply_t *r = xcb_intern_atom_reply(conn, ck, NULL);
     xcb_atom_t a = r ? r->atom : XCB_ATOM_NONE;
@@ -263,27 +273,100 @@ int mon_at_win(xcb_window_t w) {
     return mon_from_point(wx2 + (int)ww2 / 2, wy2 + (int)wh2 / 2);
 }
 
-unsigned long hex_to_xcolor(const char *hex) {
+static int parse_rgb(const char *hex, unsigned short rgb[3]) {
+    char norm[16];
     XColor color;
-    XParseColor(dpy, cmap, hex, &color);
+
+    if (!hex || !*hex) return 0;
+
+    size_t n = strlen(hex);
+    if (n == 9 && hex[0] == '#') {
+        memcpy(norm, hex, 7); norm[7] = '\0'; hex = norm;
+    } else if (n == 17 && hex[0] == '#') {
+        memcpy(norm, hex, 13); norm[13] = '\0'; hex = norm;
+    }
+
+    memset(&color, 0, sizeof(color));
+    if (!XParseColor(dpy, cmap, hex, &color)) return 0;
+    rgb[0] = color.red; rgb[1] = color.green; rgb[2] = color.blue;
+    return 1;
+}
+
+unsigned long hex_to_xcolor(const char *hex) {
+    unsigned short rgb[3];
+    if (!parse_rgb(hex, rgb)) return 0;
+    XColor color = {0};
+    color.red = rgb[0]; color.green = rgb[1]; color.blue = rgb[2];
     XAllocColor(dpy, cmap, &color);
+    if (depth == 32) color.pixel |= 0xff000000UL;
     return color.pixel;
 }
 
-void load_colors(void) {
-    unsigned long fg = hex_to_xcolor("#ffffff");
-    unsigned long bg = hex_to_xcolor("#151515"); cols.background = bg;
-    cols.foreground = fg;
-    for (int i = 0; i < 16; i++)
-        cols.cs[i] = (i == 0) ? bg : fg;
+typedef struct {
+    xcb_visualid_t vid;
+    int            depth;
+    unsigned long  rmask, gmask, bmask, amask;
+} VisLayout;
 
+#define MAX_VIS_LAYOUTS 16
+static VisLayout vis_layouts[MAX_VIS_LAYOUTS];
+static int        n_vis_layouts = 0;
+
+static const VisLayout *visual_layout(xcb_visualid_t vid, int vdepth) {
+    for (int i = 0; i < n_vis_layouts; i++)
+        if (vis_layouts[i].vid == vid) return &vis_layouts[i];
+
+    if (n_vis_layouts >= MAX_VIS_LAYOUTS) return NULL;
+
+    XVisualInfo tmpl, *vi = NULL;
+    int n = 0;
+    memset(&tmpl, 0, sizeof tmpl);
+    tmpl.visualid = vid;
+    tmpl.screen = scrno;
+    vi = XGetVisualInfo(dpy, VisualIDMask | VisualScreenMask, &tmpl, &n);
+    if (!vi || n < 1) { if (vi) XFree(vi); return NULL; }
+
+    VisLayout *L = &vis_layouts[n_vis_layouts++];
+    L->vid   = vid;
+    L->depth = vdepth ? vdepth : vi->depth;
+    L->rmask = (unsigned long)vi->red_mask;
+    L->gmask = (unsigned long)vi->green_mask;
+    L->bmask = (unsigned long)vi->blue_mask;
+    L->amask = 0;
+    if (L->depth == 32)
+        L->amask = (unsigned long)(~((L->rmask | L->gmask | L->bmask)) & 0xffffffffUL);
+    XFree(vi);
+    return L;
+}
+
+static unsigned long scale_to_mask(unsigned v16, unsigned long mask) {
+    if (!mask) return 0;
+    int shift = 0, bits = 0;
+    for (unsigned long m = mask; m && !(m & 1UL); m >>= 1) shift++;
+    for (unsigned long m = mask; m; m >>= 1) if (m & 1UL) bits++;
+    if (bits <= 0 || bits > 16) return 0;
+    unsigned long v = (bits >= 16) ? (v16 & 0xffffUL) : (unsigned long)(v16 >> (16 - bits));
+    return (v << shift) & mask;
+}
+
+static unsigned long pixel_for_visual(const unsigned short rgb[3],
+                                      xcb_visualid_t vid, int vdepth,
+                                      unsigned long fallback) {
+    const VisLayout *L = visual_layout(vid ? vid : (xcb_visualid_t)XVisualIDFromVisual(visual), vdepth);
+    if (!L) return fallback;
+    return scale_to_mask(rgb[0], L->rmask) |
+           scale_to_mask(rgb[1], L->gmask) |
+           scale_to_mask(rgb[2], L->bmask) |
+           L->amask;
+}
+
+static void load_wal_colors(void) {
     char path[256];
     const char *home = getenv("HOME");
     if (!home) return;
     snprintf(path, sizeof(path), "%s/.cache/wal/colors", home);
     FILE *f = fopen(path, "r");
     if (!f) return;
-
     char line[16];
     int i = 0;
     while (fgets(line, sizeof(line), f) && i < 16) {
@@ -291,9 +374,52 @@ void load_colors(void) {
         cols.cs[i++] = hex_to_xcolor(line);
     }
     fclose(f);
+}
 
-    cols.background = cols.cs[0];
-    cols.foreground = cols.cs[15];
+void load_colors(void) {
+    int from_cfg = (cfg->ctxbg && *cfg->ctxbg) || (cfg->ctxborder && *cfg->ctxborder);
+
+    if (from_cfg) {
+        cols.background = cfg->ctxbg    ? hex_to_xcolor(cfg->ctxbg)    : hex_to_xcolor("#151515");
+        cols.foreground = cfg->ctxborder ? hex_to_xcolor(cfg->ctxborder) : hex_to_xcolor("#2d4d66");
+    } else {
+        load_wal_colors();
+        cols.background = cols.cs[0];
+        cols.foreground = cols.cs[15];
+    }
+
+    if (!parse_rgb(cfg->deco, cols.deco_rgb) &&
+        !parse_rgb(cfg->ctxborder, cols.deco_rgb) &&
+        !parse_rgb("#2d4d66", cols.deco_rgb))
+        parse_rgb("#2d4d66", cols.deco_rgb);
+
+    for (int i = 0; i < 3; i++)
+        cols.deco_dim_rgb[i] = (unsigned short)((cols.deco_rgb[i] * 55L) / 100L);
+
+    cols.deco     = pixel_for_visual(cols.deco_rgb, 0, depth,
+                                     hex_to_xcolor(cfg->deco ? cfg->deco : "#2d4d66"));
+    cols.deco_dim = pixel_for_visual(cols.deco_dim_rgb, 0, depth, cols.deco);
+
+    {
+        unsigned r = (unsigned)((cols.background >> 16) & 0xff);
+        unsigned g = (unsigned)((cols.background >> 8) & 0xff);
+        unsigned b = (unsigned)(cols.background & 0xff);
+        int lum = (int)((r * 30 + g * 59 + b * 11) / 100);
+        unsigned short t[3];
+        unsigned long fallback;
+        if (lum > 140) {
+            t[0] = t[1] = t[2] = 0x1a1a; fallback = 0x1a1a1aUL;
+        } else {
+            t[0] = t[1] = t[2] = 0xe6e6; fallback = 0xe6e6e6UL;
+        }
+        cols.icon_text = pixel_for_visual(t, 0, depth, fallback);
+    }
+
+    cols.cs[0] = cols.deco_dim;
+    cols.cs[2] = cols.deco;
+    if (from_cfg)
+        for (int i = 0; i < 16; i++)
+            if (i != 0 && i != 2) cols.cs[i] = cols.background;
 }
 
 void xcolor_to_xftcolor(unsigned long pixel, XftColor *xft) {
@@ -365,6 +491,8 @@ xcb_window_t titlebar_create(client *c) {
     unsigned int w, h;
     win_size(c->w, &x, &y, &w, &h);
 
+    int tw = (int)w + 2 * (int)wborder();
+
     xcb_window_t titlebar = xcb_generate_id(conn);
     uint32_t mask = XCB_CW_BACK_PIXMAP | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK;
     uint32_t values[] = {
@@ -373,9 +501,14 @@ xcb_window_t titlebar_create(client *c) {
         XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION,
     };
     xcb_create_window(conn, XCB_COPY_FROM_PARENT, titlebar, root,
-                       (int16_t)x, (int16_t)(y - TITLEBAR_HEIGHT), (uint16_t)w, TITLEBAR_HEIGHT, (uint16_t)wborder(),
+                       (int16_t)x, (int16_t)(y - TITLEBAR_HEIGHT),
+                       (uint16_t)tw, TITLEBAR_HEIGHT, 0,
                        XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, mask, values);
     xcb_map_window(conn, titlebar);
+
+    c->tb_shaped = 0;
+    c->tb_clip_r[0] = c->tb_clip_r[1] = c->tb_clip_r[2] = c->tb_clip_r[3] = 0;
+
     return titlebar;
 }
 
@@ -396,9 +529,7 @@ void titlebar_draw(client *c) {
     XftColor color;
     xcolor_to_xftcolor(cols.foreground, &color);
 
-    unsigned long bg;
-
-    if (cfg->xr_colors) { bg = (c == cur) ? cols.cs[2] : 0x000000; } else { bg = (c == cur) ? cols.cs[2] : 0x000000; }
+    unsigned long bg = (c == cur) ? cols.deco : 0x000000;
 
     uint32_t fgc = (uint32_t)bg;
     xcb_change_gc(conn, tgc, XCB_GC_FOREGROUND, &fgc);
@@ -484,115 +615,170 @@ int is_titlebar(xcb_window_t w) {
     return client_from_titlebar(w) != NULL;
 }
 
-typedef struct { int16_t x, y; uint16_t w, h; } ClipRect;
-
-#define CLIP_MAX_PIECES 64
-
-static int clip_subtract_mon(const ClipRect *p, const MonitorInfo *m, ClipRect *out) {
-    int n = 0;
-    int px0 = p->x,        py0 = p->y;
-    int px1 = p->x + p->w, py1 = p->y + p->h;
-    int bx0 = m->x,        by0 = m->y;
-    int bx1 = m->x + m->w, by1 = m->y + m->h;
-
-    if (px0 >= bx1 || px1 <= bx0 || py0 >= by1 || py1 <= by0) return -1;
-
-    if (px0 < bx0) {
-        out[n].x = px0; out[n].y = py0; out[n].w = (uint16_t)(bx0 - px0); out[n].h = (uint16_t)(py1 - py0); n++;
-    }
-    if (px1 > bx1) {
-        out[n].x = bx1; out[n].y = py0; out[n].w = (uint16_t)(px1 - bx1); out[n].h = (uint16_t)(py1 - py0); n++;
-    }
-    int mx0 = MAX(px0, bx0), mx1 = MIN(px1, bx1);
-    if (mx1 > mx0) {
-        if (py0 < by0) {
-            out[n].x = mx0; out[n].y = py0; out[n].w = (uint16_t)(mx1 - mx0); out[n].h = (uint16_t)(by0 - py0); n++;
+client *client_of_window(xcb_window_t w) {
+    for (int depth = 0; w != XCB_NONE && w != root && depth < 32; depth++) {
+        for win {
+            if (c->w == w) return c;
         }
-        if (py1 > by1) {
-            out[n].x = mx0; out[n].y = by1; out[n].w = (uint16_t)(mx1 - mx0); out[n].h = (uint16_t)(py1 - by1); n++;
-        }
+
+        xcb_query_tree_cookie_t ck = xcb_query_tree(conn, w);
+        xcb_query_tree_reply_t *r = xcb_query_tree_reply(conn, ck, NULL);
+        if (!r) return NULL;
+        xcb_window_t parent = r->parent;
+        free(r);
+        if (parent == XCB_NONE) return NULL;
+        w = parent;
     }
-    return n;
+    return NULL;
 }
 
-static void canvas_shape(xcb_window_t w, const ClipRect *frame, int own_mon) {
-    if (!w) return;
+static int client_tb(const client *c) { return c->titlebar ? TITLEBAR_HEIGHT : 0; }
 
-    static ClipRect a[CLIP_MAX_PIECES], b[CLIP_MAX_PIECES];
-    int na = 1, subbed = 0;
-    a[0] = *frame;
+static void frame_rect(int x, int y, int w, int h, int top, int *r) {
+    int bw = (int)wborder();
+    r[0] = x;
+    r[1] = y - top;
+    r[2] = w + 2 * bw;
+    r[3] = h + top + 2 * bw;
+}
 
-    for (int m = 0; m < n_mons && na; m++) {
-        if (m == own_mon) continue;
-        int nb = 0;
-        for (int i = 0; i < na && nb < CLIP_MAX_PIECES - 4; i++) {
-            ClipRect rem[4];
-            int k = clip_subtract_mon(&a[i], &mons[m], rem);
-            if (k < 0) b[nb++] = a[i];
-            else { subbed = 1;
-                   for (int j = 0; j < k; j++) b[nb++] = rem[j]; }
-        }
-        memcpy(a, b, (size_t)nb * sizeof(ClipRect));
-        na = nb;
-    }
+static void client_frame(const client *c, int *r) {
+    frame_rect(c->x, c->y, c->width, c->height, client_tb(c), r);
+}
 
-    if (!subbed) {
+static void canvas_shape(xcb_window_t w, int ix, int iy, int fx, int fy,
+                         int fw, int fh, const MonitorInfo *m,
+                         unsigned char *shaped, int *cache) {
+    if (!w || !m || !shape_ok) return;
+
+    int x1 = fx + fw, y1 = fy + fh;
+
+    if (fx >= m->x && fy >= m->y && x1 <= m->x + m->w && y1 <= m->y + m->h) {
+        if (shaped && !*shaped) return;
+        if (shaped) *shaped = 0;
         xcb_shape_mask(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING, w, 0, 0, XCB_PIXMAP_NONE);
         return;
     }
 
-    xcb_rectangle_t rects[CLIP_MAX_PIECES];
-    int nr = 0;
-    for (int i = 0; i < na; i++) {
-        if (!a[i].w || !a[i].h) continue;
-        rects[nr].x      = (int16_t)(a[i].x - frame->x);
-        rects[nr].y      = (int16_t)(a[i].y - frame->y);
-        rects[nr].width  = a[i].w;
-        rects[nr].height = a[i].h;
-        nr++;
+    int x0 = MAX(fx, m->x), y0 = MAX(fy, m->y);
+    int x2 = MIN(x1, m->x + m->w), y2 = MIN(y1, m->y + m->h);
+
+    if (x2 <= x0 || y2 <= y0) { x0 = y0 = x2 = y2 = 0; }
+
+    if (shaped && *shaped && cache &&
+        cache[0] == x0 && cache[1] == y0 && cache[2] == x2 && cache[3] == y2)
+        return;
+
+    if (shaped) *shaped = 1;
+    if (cache) { cache[0] = x0; cache[1] = y0; cache[2] = x2; cache[3] = y2; }
+
+    xcb_rectangle_t rect;
+    uint32_t nrect = 0;
+
+    if (x2 > x0 && y2 > y0) {
+        rect.x      = (int16_t)(x0 - ix);
+        rect.y      = (int16_t)(y0 - iy);
+        rect.width  = (uint16_t)(x2 - x0);
+        rect.height = (uint16_t)(y2 - y0);
+        nrect = 1;
     }
 
-    if (nr == 0) {
-        xcb_rectangle_t none = { 0, 0, 0, 0 };
-        xcb_shape_rectangles(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING,
-                             XCB_CLIP_ORDERING_UNSORTED, w, 0, 0, 1, &none);
-    } else {
-        xcb_shape_rectangles(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING,
-                             XCB_CLIP_ORDERING_UNSORTED, w, 0, 0, (unsigned)nr, rects);
-    }
+    xcb_shape_rectangles(conn, XCB_SHAPE_SO_SET, XCB_SHAPE_SK_BOUNDING,
+                         XCB_CLIP_ORDERING_UNSORTED, w, 0, 0, nrect, nrect ? &rect : NULL);
 }
 
-static void canvas_clip_client(client *c, int sx, int sy) {
-    unsigned int bw = wborder();
-    int wb2 = 2 * (int)bw;
+static void canvas_clip_client(client *c) {
+    if (!c || !c->w) return;
 
-    ClipRect wf = { (int16_t)sx, (int16_t)sy,
-                    (uint16_t)(c->width + wb2), (uint16_t)(c->height + wb2) };
-    canvas_shape(c->w, &wf, c->mon);
+    int mon = (c->mon >= 0 && c->mon < n_mons) ? c->mon : 0;
+    const MonitorInfo *m = &mons[mon];
 
-    if (c->titlebar) {
-        ClipRect tf = { (int16_t)sx, (int16_t)(sy - TITLEBAR_HEIGHT),
-                        (uint16_t)(c->width + wb2), (uint16_t)TB_CONTENT_H };
-        canvas_shape(c->titlebar, &tf, c->mon);
+    int bw = (int)wborder();
+    int tb = client_tb(c);
+    int fw = (int)c->width  + 2 * bw;
+    int fh = (int)c->height + 2 * bw + tb;
+
+    canvas_shape(c->w, c->x + bw, c->y + bw, c->x, c->y - tb, fw, fh, m,
+                 &c->shaped, c->clip_r);
+
+    if (c->titlebar)
+        canvas_shape(c->titlebar, c->x, c->y - tb, c->x, c->y - tb, fw, tb, m,
+                     &c->tb_shaped, c->tb_clip_r);
+}
+
+static int client_monitor_for(const client *c, int sx, int sy) {
+    int cm = (c->mon >= 0 && c->mon < n_mons) ? c->mon : 0;
+
+    int r[4];
+    frame_rect(sx, sy, c->width, c->height, client_tb(c), r);
+
+    if (r[0] >= mons[cm].x && r[1] >= mons[cm].y &&
+        r[0] + r[2] <= mons[cm].x + mons[cm].w &&
+        r[1] + r[3] <= mons[cm].y + mons[cm].h)
+        return cm;
+
+    for (int i = 0; i < n_mons; i++) {
+        if (i == cm) continue;
+        if (r[0] >= mons[i].x && r[1] >= mons[i].y &&
+            r[0] + r[2] <= mons[i].x + mons[i].w &&
+            r[1] + r[3] <= mons[i].y + mons[i].h)
+            return i;
     }
+
+    return cm;
+}
+
+static void client_follow_monitor(client *c) {
+    if (!c) return;
+    int om = (c->mon >= 0 && c->mon < n_mons) ? c->mon : 0;
+
+    int sx = canvas_to_screen(c->cx, canvas.pan_x[om]);
+    int sy = canvas_to_screen(c->cy, canvas.pan_y[om]);
+
+    int nm = client_monitor_for(c, sx, sy);
+    if (nm == om) return;
+
+    set_client_monitor(c, nm);
+    c->cx += canvas.pan_x[om] - canvas.pan_x[nm];
+    c->cy += canvas.pan_y[om] - canvas.pan_y[nm];
+}
+
+static void client_anchor(client *c) {
+    if (!c) return;
+    if (c->mon < 0 || c->mon >= n_mons) c->mon = 0;
+
+    int nm = client_monitor_for(c, c->x, c->y);
+    if (nm != c->mon) set_client_monitor(c, nm);
+
+    c->cx = (float)c->x + canvas.pan_x[c->mon];
+    c->cy = (float)c->y + canvas.pan_y[c->mon];
+    canvas_clip_client(c);
 }
 
 static void client_place(client *c, int x, int y) {
     if (!c) return;
 
-    c->x = x;
-    c->y = y;
+    if (c->x != x || c->y != y) {
+        c->x = x;
+        c->y = y;
 
-    uint32_t values[2] = { (uint32_t)x, (uint32_t)y };
-    xcb_configure_window(conn, c->w, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
+        uint32_t values[2] = { (uint32_t)x, (uint32_t)y };
+        xcb_configure_window(conn, c->w, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, values);
 
-    if (c->titlebar) {
-        uint32_t tv[2] = { (uint32_t)x, (uint32_t)(y - TITLEBAR_HEIGHT) };
-        xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, tv);
-        titlebar_update(c);
+        if (c->titlebar) {
+            uint32_t tv[2] = { (uint32_t)x, (uint32_t)(y - TITLEBAR_HEIGHT) };
+            xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, tv);
+        }
     }
 
-    canvas_clip_client(c, x, y);
+    canvas_clip_client(c);
+}
+
+static void client_fill_monitor(client *c, const MonitorInfo *m) {
+    int bw = (int)wborder();
+    int tb = cfg->titlebar ? TITLEBAR_HEIGHT : 0;
+    resizeclient(c, (int)m->w - 2 * bw, (int)m->h - 2 * bw - tb);
+    client_place(c, m->x, m->y + tb);
 }
 
 void client_move(client *c, int x, int y) {
@@ -624,14 +810,16 @@ void client_move(client *c, int x, int y) {
 void update_borders(void) {
     for win {
         uint32_t values[1];
-	if (c == cur) {
-	    values[0] = cols.cs[2];
-	} else {
-	    values[0] = cols.cs[0];
-	}
+        if (c == cur)
+            values[0] = (uint32_t)pixel_for_visual(cols.deco_rgb, c->vid, c->vdepth, cols.deco);
+        else
+            values[0] = (uint32_t)pixel_for_visual(cols.deco_dim_rgb, c->vid, c->vdepth, cols.deco_dim);
         xcb_change_window_attributes(conn, c->w, XCB_CW_BORDER_PIXEL, values);
-        if (c->titlebar)
-            xcb_change_window_attributes(conn, c->titlebar, XCB_CW_BORDER_PIXEL, values);
+        if (c->titlebar) {
+            uint32_t tv[1];
+            tv[0] = (c == cur) ? (uint32_t)cols.deco : (uint32_t)cols.deco_dim;
+            xcb_change_window_attributes(conn, c->titlebar, XCB_CW_BORDER_PIXEL, tv);
+        }
     }
     if (cur) {
         xcb_window_t w = cur->w;
@@ -641,15 +829,71 @@ void update_borders(void) {
     update_client_list_stacking();
 }
 
+void titlebar_redraw_all(void) {
+    for win
+        if (c->titlebar) titlebar_draw(c);
+    xcb_flush(conn);
+}
+
+void apply_colors(void) {
+    load_colors();
+    update_borders();
+    titlebar_redraw_all();
+    icons_rebuild();
+    canvas_apply_all();
+    sbcs_refresh();
+    xcb_flush(conn);
+}
+
+static void fs_confine_sync(void) {
+    if (!xf_bar_ok || fs_grab_win == XCB_NONE) return;
+
+    client *fc = NULL;
+    for win
+        if (c->w == fs_grab_win) { fc = c; break; }
+    if (!fc || !fc->f || fc->mon < 0 || fc->mon >= n_mons) return;
+
+    const MonitorInfo *m = &mons[fc->mon];
+    int tb = cfg->titlebar ? TITLEBAR_HEIGHT : 0;
+    if (fs_bar_n) xf_fs_unconfine();
+    xf_fs_confine(m->x, m->y + tb, m->w, m->h - tb);
+}
+
+void apply_titlebars(void) {
+    int want = cfg->titlebar ? 1 : 0;
+
+    for win {
+        if (want && !c->titlebar) {
+            c->titlebar = titlebar_create(c);
+            titlebar_update(c);
+            if (c->f && c->mon < n_mons)
+                client_fill_monitor(c, &mons[c->mon]);
+        } else if (!want && c->titlebar) {
+            titlebar_del(c);
+            c->tb_shaped = 0;
+            if (c->f && c->mon < n_mons)
+                client_fill_monitor(c, &mons[c->mon]);
+        }
+    }
+
+    canvas_apply_all();
+    docks_raise();
+    xcb_flush(conn);
+}
+
 void update_border_widths(void) {
     uint32_t bw = wborder();
     for win {
         xcb_configure_window(conn, c->w, XCB_CONFIG_WINDOW_BORDER_WIDTH, &bw);
-        if (c->titlebar)
-            xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_BORDER_WIDTH, &bw);
+        if (c->titlebar) {
+            uint32_t tw = c->width + 2 * (int)bw;
+            xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_WIDTH, &tw);
+        }
+        client_place(c, c->x, c->y);
     }
     update_borders();
     canvas_apply_all();
+    sbcs_refresh();
     xcb_flush(conn);
 }
 
@@ -657,17 +901,17 @@ void update_client_list_stacking(void) {
     xcb_query_tree_cookie_t qc = xcb_query_tree(conn, root);
     xcb_query_tree_reply_t *qr = xcb_query_tree_reply(conn, qc, NULL);
     if (!qr) return;
- 
+
     xcb_window_t *children = xcb_query_tree_children(qr);
     int nchild = xcb_query_tree_children_length(qr);
- 
+
     xcb_window_t *stack = malloc(sizeof(xcb_window_t) * (size_t)nchild);
     if (stack) {
         int n = 0;
         for (int i = 0; i < nchild; i++)
             for win
                 if (c->w == children[i]) { stack[n++] = c->w; break; }
- 
+
         xcb_change_property(conn, XCB_PROP_MODE_REPLACE, root, net_client_list_stacking,
                              XCB_ATOM_WINDOW, 32, (uint32_t)n, stack);
         free(stack);
@@ -702,10 +946,10 @@ void resizeclient(client *c, int w, int h) {
     configure(c);
 
     if (c->titlebar) {
-        uint32_t tv[2] = { (uint32_t)w, TITLEBAR_HEIGHT };
-        xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, tv);
+        uint32_t tv = c->width + 2 * wborder();
+        xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_WIDTH, &tv);
     }
-    canvas_clip_client(c, c->x, c->y);
+    canvas_clip_client(c);
     xcb_flush(conn);
 }
 
@@ -820,7 +1064,7 @@ void canvas_apply_all(void) {
     for win {
         if (c->f) continue;
 
-        int m = c->mon;
+        int m = (c->mon >= 0 && c->mon < n_mons) ? c->mon : 0;
         float px = canvas.pan_x[m];
         float py = canvas.pan_y[m];
 
@@ -831,9 +1075,38 @@ void canvas_apply_all(void) {
     }
 
     xcb_flush(conn);
-    titlebar_update(cur);
     canvas_sync_to_root();
     icons_reposition();
+}
+
+static void apply_pending(void) {
+    if (!drag_dirty && !resize_dirty && !layout_dirty) return;
+
+    long now = now_ms();
+    if (frame_last_ms && now - frame_last_ms < FRAME_MIN_MS) return;
+    frame_last_ms = now;
+
+    if (drag_dirty) {
+        drag_dirty = 0;
+        client *c = drag_c;
+        drag_c = NULL;
+        if (c) {
+            client_move(c, drag_tx, drag_ty);
+            client_anchor(c);
+            docks_raise();
+            physics_push_away(c);
+        }
+    }
+
+    if (resize_dirty) {
+        resize_dirty = 0;
+        if (cur) client_resize(cur, resize_tw, resize_th);
+    }
+
+    if (layout_dirty) {
+        layout_dirty = 0;
+        canvas_apply_all();
+    }
 }
 
 void canvas_pan(int mon, float dx, float dy) {
@@ -905,8 +1178,8 @@ void ctx_open(int x, int y) {
 
     ctx_x = cx; ctx_y = cy; ctx_w = w; ctx_h = h; ctx_itemh = itemh;
 
-    unsigned long bg = cfg->ctxbg ? hex_to_xcolor(cfg->ctxbg) : cols.background;
-    unsigned long bd = cfg->ctxborder ? hex_to_xcolor(cfg->ctxborder) : cols.cs[2];
+    unsigned long bg = cols.background;
+    unsigned long bd = cols.foreground;
 
     ctx_win = xcb_generate_id(conn);
     uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_OVERRIDE_REDIRECT;
@@ -924,7 +1197,7 @@ void ctx_open(int x, int y) {
     if (title_font) {
         XftDraw *draw = XftDrawCreate(dpy, ctx_win, visual, cmap);
         XftColor color;
-        xcolor_to_xftcolor(cols.foreground, &color);
+        xcolor_to_xftcolor(0xffffff, &color);
         for (int i = 0; i < cfg->nctx; i++) {
             if (!cfg->ctx[i].label) continue;
             int ly = pady + i * itemh + (itemh + title_font->ascent - title_font->descent) / 2;
@@ -936,6 +1209,19 @@ void ctx_open(int x, int y) {
 
     XFlush(dpy);
     xcb_flush(conn);
+}
+
+void focus_win_id(xcb_window_t w) {
+    for win if (c->w == w) {
+        uint32_t stack = XCB_STACK_MODE_ABOVE;
+        xcb_configure_window(conn, c->w, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
+        if (c->titlebar)
+            xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
+        docks_raise();
+        win_focus(c);
+        titlebar_update(cur);
+        return;
+    }
 }
 
 void win_focus(client *c) {
@@ -975,11 +1261,11 @@ void canvas_focus(client *c) {
     int mx = 0, my = 0, mw = sw, mh = sh;
     if (m < n_mons) { mx = mons[m].x; my = mons[m].y; mw = mons[m].w; mh = mons[m].h; }
 
-    unsigned int cw, ch;
-    win_size(c->w, NULL, NULL, &cw, &ch);
+    int fr[4];
+    client_frame(c, fr);
 
-    float target_sx = mx + (mw - (int)cw) / 2.0f;
-    float target_sy = my + (mh - (int)ch) / 2.0f;
+    float target_sx = mx + (mw - fr[2]) / 2.0f;
+    float target_sy = my + (mh - fr[3]) / 2.0f;
 
     canvas.pan_x[m] = c->cx - target_sx;
     canvas.pan_y[m] = c->cy - target_sy;
@@ -1006,6 +1292,10 @@ static long    th_t[THROW_SAMPLES];
 static int     th_n;
 
 typedef struct { float x0, y0, x1, y1; } PhysBox;
+
+static float phys_speed(const client *c) {
+    return sqrtf(c->vx * c->vx + c->vy * c->vy);
+}
 
 void physics_wake(client *c)  { if (c && !c->f) c->awake = 1; }
 void physics_sleep(client *c) { if (c) { c->vx = 0; c->vy = 0; c->awake = 0; } }
@@ -1063,12 +1353,12 @@ void physics_drag_start(client *c) {
 }
 
 static void phys_box(const client *c, PhysBox *b) {
-    unsigned int bw = wborder();
-    int tb = cfg->titlebar ? TITLEBAR_HEIGHT : 0;
-    b->x0 = c->cx - (float)bw;
-    b->y0 = c->cy - (float)tb;
-    b->x1 = c->cx + (float)c->width  + (float)bw;
-    b->y1 = c->cy + (float)c->height + (float)bw;
+    int bw = (int)wborder();
+    int top = client_tb(c);
+    b->x0 = c->cx;
+    b->y0 = (float)c->cy - (float)top;
+    b->x1 = c->cx + (float)c->width  + (float)(2 * bw);
+    b->y1 = c->cy + (float)c->height + (float)(2 * bw);
 }
 
 static float phys_mass(const client *c) {
@@ -1082,6 +1372,23 @@ static int phys_overlap(const PhysBox *a, const PhysBox *b, float *ox, float *oy
     return (*ox > 0.0f && *oy > 0.0f);
 }
 
+/* the contact normal and penetration depth of two overlapping boxes: the
+   axis of least overlap is the one the X server would separate them along */
+static void phys_normal(const PhysBox *pa, const PhysBox *pb, float ox, float oy,
+                        float *nx, float *ny, float *pen) {
+    float acx = (pa->x0 + pa->x1) * 0.5f, bcx = (pb->x0 + pb->x1) * 0.5f;
+    float acy = (pa->y0 + pa->y1) * 0.5f, bcy = (pb->y0 + pb->y1) * 0.5f;
+
+    *nx = *ny = 0.0f;
+    if (ox < oy) {
+        *nx  = (acx < bcx) ? -1.0f : 1.0f;
+        *pen = ox;
+    } else {
+        *ny  = (acy < bcy) ? -1.0f : 1.0f;
+        *pen = oy;
+    }
+}
+
 static void phys_resolve(client *a, client *b) {
     if (a == b || a->f || b->f || a->mon != b->mon || a->mon >= n_mons) return;
 
@@ -1092,28 +1399,30 @@ static void phys_resolve(client *a, client *b) {
     float ox, oy;
     if (!phys_overlap(pa, pb, &ox, &oy)) return;
 
+    /* the dragged window is an infinite mass body, like a hand on the cue */
     float ia = (a == phys_held) ? 0.0f : 1.0f / phys_mass(a);
     float ib = (b == phys_held) ? 0.0f : 1.0f / phys_mass(b);
     float isum = ia + ib;
     if (isum <= 0.0f) return;
 
-    float nx = 0, ny = 0, pen;
-    if (ox < oy) {
-        nx  = ((a->cx + a->width * 0.5f) < (b->cx + b->width * 0.5f)) ? -1.0f : 1.0f;
-        pen = ox;
-    } else {
-        ny  = ((a->cy + a->height * 0.5f) < (b->cy + b->height * 0.5f)) ? -1.0f : 1.0f;
-        pen = oy;
-    }
+    float nx, ny, pen;
+    phys_normal(pa, pb, ox, oy, &nx, &ny, &pen);
 
+    /* Push them apart along the normal, weighted by inverse mass, so a big
+       window barely moves and a small one gets shoved clear. */
     float corr = MAX(pen - PHYS_SLOP, 0.0f) / isum * PHYS_CORRECT;
     a->cx += nx * corr * ia;
     a->cy += ny * corr * ia;
     b->cx -= nx * corr * ib;
     b->cy -= ny * corr * ib;
 
-    float rv = (b->vx - a->vx) * nx + (b->vy - a->vy) * ny;
-    if (rv < 0.0f) {
+    /* Impulse on the normal component only: the tangent is untouched, so a
+       clipping hit glances off sideways the way a struck ball does instead
+       of stopping dead, and momentum is conserved between the two.
+
+       n points from b to a, so a is closing on b while rv is negative. */
+    float rv = (a->vx - b->vx) * nx + (a->vy - b->vy) * ny;
+    if (rv < -PHYS_BOUNCE_MIN) {
         float j = -(1.0f + PHYS_RESTITUTION) * rv / isum;
         a->vx += j * ia * nx;
         a->vy += j * ia * ny;
@@ -1121,8 +1430,10 @@ static void phys_resolve(client *a, client *b) {
         b->vy -= j * ib * ny;
     }
 
-    if (ia > 0.0f && sqrtf(a->vx*a->vx + a->vy*a->vy) > PHYS_STOP_SPEED) a->awake = 1;
-    if (ib > 0.0f && sqrtf(b->vx*b->vx + b->vy*b->vy) > PHYS_STOP_SPEED) b->awake = 1;
+    /* A hit is what wakes a window up, so a sleeping one that just took the
+       impulse does not keep its speed frozen in a body that never moves. */
+    if (a != phys_held && phys_speed(a) > PHYS_STOP_SPEED) a->awake = 1;
+    if (b != phys_held && phys_speed(b) > PHYS_STOP_SPEED) b->awake = 1;
 
     phys_dirty = 1;
 }
@@ -1141,7 +1452,7 @@ void physics_push_away(client *pusher) {
     prev_cx = pusher->cx;
     prev_cy = pusher->cy;
     prev_ms = now;
-    float vspeed = MAX(sqrtf(vpx*vpx + vpy*vpy), 140.0f);
+    float vspeed = MIN(MAX(sqrtf(vpx*vpx + vpy*vpy), 140.0f), PHYS_VMAX);
 
     for win {
         client *o = c;
@@ -1154,24 +1465,19 @@ void physics_push_away(client *pusher) {
         float ox, oy;
         if (!phys_overlap(&bp, &bo, &ox, &oy)) continue;
 
-        float nx = 0, ny = 0, pen;
-        if (ox < oy) {
-            nx  = ((pusher->cx + pusher->width * 0.5f) < (o->cx + o->width * 0.5f)) ? -1.0f : 1.0f;
-            pen = ox;
-        } else {
-            ny  = ((pusher->cy + pusher->height * 0.5f) < (o->cy + o->height * 0.5f)) ? -1.0f : 1.0f;
-            pen = oy;
-        }
+        float nx, ny, pen;
+        phys_normal(&bp, &bo, ox, oy, &nx, &ny, &pen);
 
-        o->cx += nx * (pen + 2.0f);
-        o->cy += ny * (pen + 2.0f);
-        o->vx  = nx * vspeed;
-        o->vy  = ny * vspeed;
+        /* n points from the dragged window to o, so o leaves along -n */
+        o->cx -= nx * (pen + 2.0f);
+        o->cy -= ny * (pen + 2.0f);
+        o->vx  = -nx * vspeed;
+        o->vy  = -ny * vspeed;
         o->awake = 1;
 
-        float px = canvas.pan_x[o->mon], py = canvas.pan_y[o->mon];
-        client_place(o, canvas_to_screen(o->cx, px), canvas_to_screen(o->cy, py));
-        phys_dirty = 1;
+        client_follow_monitor(o);
+
+        layout_dirty = 1;
     }
 }
 
@@ -1181,6 +1487,18 @@ static int phys_any_moving(void) {
     return 0;
 }
 
+/* every pair once: the doubly linked ring has no sentinel of its own, so
+   list->prev is the last window and closes the ring back onto the first */
+static void phys_pairs(void) {
+    for (client *a = list; a != list->prev; a = a->next)
+        for (client *b = a->next; b != list->prev; b = b->next)
+            phys_resolve(a, b);
+
+    for (client *b = list; b != list->prev; b = b->next)
+        phys_resolve(list->prev, b);
+}
+
+/* deep enough to count as resting: touching is not overlapping */
 static int phys_sleep_ok(const client *me) {
     PhysBox bc;
     phys_box(me, &bc);
@@ -1189,7 +1507,8 @@ static int phys_sleep_ok(const client *me) {
         PhysBox bo;
         phys_box(c, &bo);
         float ox, oy;
-        if (phys_overlap(&bc, &bo, &ox, &oy)) return 0;
+        if (phys_overlap(&bc, &bo, &ox, &oy) &&
+            MIN(ox, oy) > PHYS_SLOP * 2.0f) return 0;
     }
     return 1;
 }
@@ -1200,39 +1519,60 @@ void physics_tick(void) {
     long now = now_ms();
     float dt = (now - phys_last_ms) / 1000.0f;
     phys_last_ms = now;
-    if (dt < 0.0f)   dt = 0.0f;
-    if (dt > 0.05f)  dt = 0.05f;
+    if (dt < 0.0f)  dt = 0.0f;
+    if (dt > 0.05f) dt = 0.05f;
     if (!list || !phys_any_moving()) return;
 
+    /* friction is a property of the frame, so it is applied once here and
+       the translation below is sub-stepped for the contacts only */
     float damp = expf(-PHYS_FRICTION * dt);
+    float fastest = 0.0f;
 
     for win {
         if (c->f || !c->awake || c == phys_held) continue;
         c->vx *= damp;
         c->vy *= damp;
-        float sp = sqrtf(c->vx*c->vx + c->vy*c->vy);
-        if (sp > PHYS_VMAX) { c->vx *= PHYS_VMAX/sp; c->vy *= PHYS_VMAX/sp; }
-        c->cx += c->vx * dt;
-        c->cy += c->vy * dt;
-        phys_dirty = 1;
+        float sp = phys_speed(c);
+        if (sp > PHYS_VMAX) { c->vx *= PHYS_VMAX / sp; c->vy *= PHYS_VMAX / sp; sp = PHYS_VMAX; }
+        if (sp > fastest) fastest = sp;
     }
 
-    for (client *a = list; a;) {
-        for (client *b = a->next; b && b != list; b = b->next)
-            phys_resolve(a, b);
-        a = (a->next == list) ? NULL : a->next;
+    /* Sub-step the motion so a fast window cannot jump clean over another one
+       between two overlap tests. That ghosting is what made a hard throw feel
+       like it went through a stack instead of into it: the window moves at
+       most PHYS_MAX_STEP px per sub-step, and the closing speed of two bodies
+       is at most twice the fastest one, so every contact is seen. */
+    int steps = 1;
+    float travel = fastest * 2.0f * dt;
+    if (travel > PHYS_MAX_STEP) {
+        steps = (int)(travel / PHYS_MAX_STEP) + 1;
+        if (steps > PHYS_SUBSTEPS) steps = PHYS_SUBSTEPS;
     }
+    float h = dt / (float)steps;
+
+    for (int s = 0; s < steps; s++) {
+        for win {
+            if (c->f || !c->awake || c == phys_held) continue;
+            c->cx += c->vx * h;
+            c->cy += c->vy * h;
+            phys_dirty = 1;
+        }
+        for (int it = 0; it < PHYS_ITERATIONS; it++)
+            phys_pairs();
+    }
+
+    for win
+        if (!c->f && c->awake) client_follow_monitor(c);
 
     for win {
         if (c->f || !c->awake || c == phys_held) continue;
-        float sp = sqrtf(c->vx*c->vx + c->vy*c->vy);
-        if (sp < PHYS_STOP_SPEED && phys_sleep_ok(c))
+        if (phys_speed(c) < PHYS_STOP_SPEED && phys_sleep_ok(c))
             physics_sleep(c);
     }
 
     if (phys_dirty) {
-        canvas_apply_all();
         phys_dirty = 0;
+        layout_dirty = 1;
     }
 }
 
@@ -1303,6 +1643,7 @@ void client_message(xcb_generic_event_t *gen_e) {
     xcb_client_message_event_t *e = (xcb_client_message_event_t *)gen_e;
 
     if (e->type == wm_protocols && e->data.data32[0] == wm_delete_window) {
+        if (sbcs_win != XCB_NONE && e->window == sbcs_win) { sbcs_close(); return; }
         win_del(e->window);
         return;
     }
@@ -1352,6 +1693,8 @@ void configure_notify(xcb_configure_notify_event_t *e) {
         return;
     }
 
+    if (sbcs_handle_configure(e)) return;
+
     if (dock_known(e->window))
         return;
 
@@ -1365,7 +1708,7 @@ void focusin(xcb_focus_in_event_t *e) {
     if (cur && e->event != cur->w)
         xcb_set_input_focus(conn, XCB_INPUT_FOCUS_PARENT, cur->w, XCB_CURRENT_TIME);
 }
- 
+
 void notify_unmap(xcb_unmap_notify_event_t *e) {
     xcb_window_t w = e->window;
 
@@ -1383,6 +1726,8 @@ void notify_unmap(xcb_unmap_notify_event_t *e) {
 void notify_enter(xcb_enter_notify_event_t *e) {
     if (e->mode != XCB_NOTIFY_MODE_NORMAL || e->detail == XCB_NOTIFY_DETAIL_INFERIOR)
         return;
+
+    if (!cfg->focus_follow) return;
 
     for win
         if (c->w == e->event) {
@@ -1410,55 +1755,71 @@ void notify_motion(xcb_motion_notify_event_t *e) {
         float dy = e->root_y - pan_start_y;
         canvas.pan_x[pan_mon] = pan_origin_x - dx;
         canvas.pan_y[pan_mon] = pan_origin_y - dy;
-        canvas_apply_all();
+        layout_dirty = 1;
         return;
     }
 
     if (icon_handle_motion(e)) return;
+    if (sbcs_handle_motion(e)) return;
 
     if (!cur || !drag_subwindow || cur->f) return;
- 
+
     int xd = e->root_x - drag_root_x;
     int yd = e->root_y - drag_root_y;
- 
+
     if (drag_button == XCB_BUTTON_INDEX_1) {
         throw_sample(e->root_x, e->root_y);
 
-        int new_sx = cur->wx + xd;
-        int new_sy = cur->wy + yd;
- 
-        int cenx = new_sx + (int)(cur->ww / 2);
-        int ceny = new_sy + (int)(cur->wh / 2);
- 
-	for (int i = 0; i < n_mons; i++) {
-	    if (cenx >= mons[i].x && cenx < mons[i].x + mons[i].w &&
-		ceny >= mons[i].y && ceny < mons[i].y + mons[i].h) {
-		set_client_monitor(cur, i);
-		    break;
-	    }
- 
-	}
- 
-        client_move(cur, new_sx, new_sy);
- 
-        if (cur->titlebar) {
-            uint32_t stack = XCB_STACK_MODE_ABOVE;
-            xcb_configure_window(conn, cur->titlebar, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
-        }
-        docks_raise();
- 
-        int m = cur->mon;
-        cur->cx = (float)new_sx + canvas.pan_x[m];
-        cur->cy = (float)new_sy + canvas.pan_y[m];
-
-        physics_push_away(cur);
+        drag_c  = cur;
+        drag_tx = cur->wx + xd;
+        drag_ty = cur->wy + yd;
+        drag_dirty = 1;
     } else if (drag_button == XCB_BUTTON_INDEX_3) {
-        client_resize(cur, (unsigned)MAX(1, (int)cur->ww + xd), (unsigned)MAX(1, (int)cur->wh + yd));
+        resize_tw = (unsigned)MAX(1, (int)cur->ww + xd);
+        resize_th = (unsigned)MAX(1, (int)cur->wh + yd);
+        resize_dirty = 1;
     }
 }
 
+xcb_keysym_t event_keysym(xcb_key_press_event_t *e) {
+    return xcb_key_press_lookup_keysym(keysyms, e, 0);
+}
+
+int event_text(xcb_key_press_event_t *e, char *buf, size_t n) {
+    if (!buf || n == 0) return 0;
+    buf[0] = 0;
+    if (!keysyms) return 0;
+
+    int level = (e->state & XCB_MOD_MASK_SHIFT) ? 1 : 0;
+    xcb_keysym_t ks = xcb_key_symbols_get_keysym(keysyms, e->detail, level);
+    if (ks == XCB_NO_SYMBOL) return 0;
+
+    if (ks == XK_space) {
+        if (n < 2) return 0;
+        buf[0] = ' ';
+        buf[1] = 0;
+        return 1;
+    }
+    if (ks >= 0x20 && ks <= 0x7e) {
+        if (n < 2) return 0;
+        buf[0] = (char)ks;
+        buf[1] = 0;
+        return 1;
+    }
+    if (ks >= 0xa0 && ks <= 0xff) {
+        if (n < 3) return 0;
+        buf[0] = (char)(0xc0 | (ks >> 6));
+        buf[1] = (char)(0x80 | (ks & 0x3f));
+        buf[2] = 0;
+        return 2;
+    }
+    return 0;
+}
+
 void key_press(xcb_key_press_event_t *e) {
-    xcb_keysym_t keysym = xcb_key_press_lookup_keysym(keysyms, e, 0);
+    if (sbcs_handle_key(e)) return;
+
+    xcb_keysym_t keysym = event_keysym(e);
     for (unsigned int i = 0; i < (unsigned)cfg->nkeys; ++i)
 	if (cfg->keys[i].keysym == keysym && mod_clean(cfg->keys[i].mod) == mod_clean(e->state))
 	    cfg->keys[i].function(cfg->keys[i].arg);
@@ -1487,12 +1848,23 @@ void button_press(xcb_button_press_event_t *gen_e) {
 
     if (icon_handle_press(e)) return;
 
+    if (sbcs_win != XCB_NONE && e->event == sbcs_win) focus_win_id(sbcs_win);
+
+    if (sbcs_handle_press(e)) return;
+
     if (e->event == root && (e->child == XCB_NONE || e->child == ctx_win)) {
         if (ctx_win != XCB_NONE && e->detail == XCB_BUTTON_INDEX_1) {
-            int idx = (e->root_y - ctx_y) / ctx_itemh;
+            int bw = (int)wborder();
+            int inside = e->root_x >= ctx_x - bw && e->root_x < ctx_x + ctx_w + bw &&
+                         e->root_y >= ctx_y - bw && e->root_y < ctx_y + ctx_h + bw;
+            if (inside) {
+                int idx = (e->root_y - ctx_y) / ctx_itemh;
+                ctx_close();
+                if (idx >= 0 && idx < cfg->nctx && cfg->ctx[idx].function)
+                    cfg->ctx[idx].function(cfg->ctx[idx].arg);
+                return;
+            }
             ctx_close();
-            if (idx >= 0 && idx < cfg->nctx && cfg->ctx[idx].function)
-                cfg->ctx[idx].function(cfg->ctx[idx].arg);
             return;
         }
         if (e->detail == XCB_BUTTON_INDEX_3) {
@@ -1512,7 +1884,7 @@ void button_press(xcb_button_press_event_t *gen_e) {
     }
 
     if (!cur) return;
- 
+
     if (e->detail == XCB_BUTTON_INDEX_2) {
         pan_active   = 1;
         pan_mon      = mon_at_ptr();
@@ -1534,17 +1906,17 @@ return;
     if (is_titlebar(e->event) && !(e->state & MOD)) {
         client *c = client_from_titlebar(e->event);
         if (!c) return;
- 
+
         unsigned int tw, th;
         win_size(c->titlebar, NULL, NULL, &tw, &th);
- 
+
         int btn_w  = 22;
         int btn_x = (int)tw - 26;
         int btn_f  = btn_x - btn_w - 2;
 
         if (e->detail == XCB_BUTTON_INDEX_1 && e->event_x >= btn_x) { win_kill((Arg){0}); return; }
         if (e->detail == XCB_BUTTON_INDEX_1 && e->event_x >= btn_f && e->event_x < btn_x) { win_fs((Arg){0}); return; }
- 
+
         win_focus(c);
         win_size(c->w, &c->wx, &c->wy, &c->ww, &c->wh);
         drag_subwindow = c->w;
@@ -1553,7 +1925,7 @@ return;
         drag_root_y = e->root_y;
         begin_pointer_grab();
         physics_drag_start(c);
- 
+
         uint32_t stack = XCB_STACK_MODE_ABOVE;
         xcb_configure_window(conn, c->w, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
         xcb_configure_window(conn, c->titlebar, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
@@ -1561,14 +1933,14 @@ return;
         xcb_flush(conn);
         return;
     }
-  
+
     if (!e->child) return;
-  
+
     client *target = NULL;
     for win {
         if (c->w == e->child || c->titlebar == e->child) { target = c; break; }
     }
-  
+
     if (target) {
         win_focus(target);
         uint32_t stack = XCB_STACK_MODE_ABOVE;
@@ -1582,17 +1954,15 @@ return;
         if (cur && cur->titlebar) xcb_configure_window(conn, cur->titlebar, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
     }
     docks_raise();
-  
+
     drag_subwindow = e->child;
     drag_button = e->detail;
     drag_root_x = e->root_x;
     drag_root_y = e->root_y;
 
-    client *held = NULL;
-    for win if (c->w == e->child || c->titlebar == e->child) { held = c; break; }
     begin_pointer_grab();
-    physics_drag_start(held);
- 
+    physics_drag_start(target ? target : client_of_window(e->child));
+
     xcb_flush(conn);
 }
 
@@ -1600,11 +1970,8 @@ void button_release(xcb_button_release_event_t *e) {
     if (icon_handle_release(e)) return;
     if (pan_active) pan_active = 0;
 
-    if (drag_subwindow && drag_button == XCB_BUTTON_INDEX_1) {
-        client *dc = NULL;
-        for win if (c->w == drag_subwindow) dc = c;
-        if (dc) physics_drag_release(dc, e->root_x, e->root_y);
-    }
+    if (drag_button == XCB_BUTTON_INDEX_1 && phys_held)
+        physics_drag_release(phys_held, e->root_x, e->root_y);
 
     phys_held   = NULL;
     drag_subwindow = 0;
@@ -1618,6 +1985,15 @@ void win_add(xcb_window_t w) {
 
     c->w = w;
     set_client_monitor(c, mon_at_win(w));
+
+    {
+        xcb_get_window_attributes_reply_t *wa =
+            xcb_get_window_attributes_reply(conn, xcb_get_window_attributes(conn, w), NULL);
+        if (wa) {
+            c->vid = wa->visual;
+            free(wa);
+        }
+    }
 
     int sx = 0, sy = 0;
     unsigned int dw2, dh2;
@@ -1646,6 +2022,7 @@ void win_add(xcb_window_t w) {
         list       = c;
         list->prev = list->next = list;
     }
+    canvas_clip_client(c);
     xcb_flush(conn);
 }
 
@@ -1661,14 +2038,14 @@ void win_del(xcb_window_t w) {
     }
 
     if (x->titlebar) titlebar_del(x);
-    
+
     if (x->prev == x) list = NULL;
     if (list == x)    list = x->next;
     if (x->next) x->next->prev = x->prev;
     if (x->prev) x->prev->next = x->next;
-    
+
     if (x == cur) cur = NULL;
-    
+
     free(x);
     xcb_flush(conn);
 }
@@ -1716,32 +2093,30 @@ void win_center(const Arg arg) {
         free(ptr);
     }
 
-    int total_w = (int)ww_;
-    int total_h = (int)wh_ + wborder();
+    int bw = (int)wborder();
+    int tb = client_tb(cur);
+    int total_w = (int)ww_ + 2 * bw;
+    int total_h = (int)wh_ + 2 * bw + tb;
 
     int sx = mx + (mw - total_w) / 2;
-    int sy = my + (mh - total_h) / 2;
+    int sy = my + (mh - total_h) / 2 + tb;
 
     client_move(cur, sx, sy);
-
-    set_client_monitor(cur, mon_at_win(cur->w));
-    int m = cur->mon;
-    cur->cx = (float)sx + canvas.pan_x[m];
-    cur->cy = (float)sy + canvas.pan_y[m];
+    client_anchor(cur);
 }
 
 static int spawn_spot_free(const client *skip, int sx, int sy, unsigned int ww, unsigned int wh) {
-    unsigned int bw = wborder();
-    int tb = cfg->titlebar ? TITLEBAR_HEIGHT : 0;
+    int ar[4];
+    frame_rect(sx, sy, (int)ww, (int)wh, cfg->titlebar ? TITLEBAR_HEIGHT : 0, ar);
 
-    int ax0 = sx - (int)bw - 1,          ay0 = sy - tb - (int)bw - 1;
-    int ax1 = sx + (int)ww + (int)bw + 1, ay1 = sy + (int)wh + (int)bw + 1;
+    int ax0 = ar[0] - 1,          ay0 = ar[1] - 1;
+    int ax1 = ar[0] + ar[2] + 1,  ay1 = ar[1] + ar[3] + 1;
 
     for win {
         if (c == skip || c->f || !c->width || !c->height) continue;
-        int bx0 = c->x - (int)bw,             by0 = c->y - tb;
-        int bx1 = c->x + c->width + (int)bw,  by1 = c->y + c->height + (int)bw;
-        if (ax0 < bx1 && ax1 > bx0 && ay0 < by1 && ay1 > by0) return 0;
+        int br[4];
+        client_frame(c, br);
+        if (ax0 < br[0] + br[2] && ax1 > br[0] && ay0 < br[1] + br[3] && ay1 > br[1]) return 0;
     }
     return 1;
 }
@@ -1752,7 +2127,7 @@ static int spawn_search_rings(const client *skip, int bx, int by,
     unsigned int bw = wborder();
     int bwi = (int)bw;
     int tw = (int)ww + 2 * (int)bw;
-    int th = (int)wh + 2 * (int)bw + wborder();
+    int th = (int)wh + 2 * (int)bw + (cfg->titlebar ? TITLEBAR_HEIGHT : 0);
 
     for (int r = 1; r <= SPAWN_SEARCH_MAX; r++) {
         for (int t = -r; t <= r; t++) {
@@ -1764,10 +2139,12 @@ static int spawn_search_rings(const client *skip, int bx, int by,
             };
             for (int k = 0; k < 4; k++) {
                 int sx = cand[k][0], sy = cand[k][1];
-                if (require_inside &&
-                    (sx < mx + bwi || sx > mx + mw - tw ||
-                     sy < my + bwi || sy > my + mh - th))
-                    continue;
+                if (require_inside) {
+                    int top = sy - (cfg->titlebar ? TITLEBAR_HEIGHT : 0);
+                    if (sx < mx + bwi || sx + tw > mx + mw - bwi ||
+                        top < my + bwi || top + th > my + mh - bwi)
+                        continue;
+                }
                 if (spawn_spot_free(skip, sx, sy, ww, wh)) { *ox = sx; *oy = sy; return 1; }
             }
         }
@@ -1790,28 +2167,31 @@ void win_place_free(client *c) {
     }
 
     unsigned int bw = wborder();
-    int tw = (int)ww_ + 2 * (int)bw;
-    int th = (int)wh_ + 2 * (int)bw + wborder();
+    int bwi = (int)bw;
+    int tw = (int)ww_ + 2 * bwi;
+    int th = (int)wh_ + 2 * bwi + (cfg->titlebar ? TITLEBAR_HEIGHT : 0);
 
     int bx = mx + (mw - tw) / 2;
-    int by = my + (mh - th) / 2;
+    int by = my + (mh - th) / 2 + (cfg->titlebar ? TITLEBAR_HEIGHT : 0);
 
     int fx = bx, fy = by;
 
     if (!spawn_spot_free(c, bx, by, ww_, wh_)) {
         if (!spawn_search_rings(c, bx, by, ww_, wh_, 1, mx, my, mw, mh, &fx, &fy) &&
             !spawn_search_rings(c, bx, by, ww_, wh_, 0, 0, 0, 0, 0, &fx, &fy)) {
-            fx = bx + (SPAWN_SEARCH_MAX + 1) * SPAWN_SEARCH_STEP;
-            fy = by + (SPAWN_SEARCH_MAX + 1) * SPAWN_SEARCH_STEP;
+            fx = bx;
+            fy = by;
         }
     }
 
-    client_move(c, fx, fy);
+    if (fx < mx + bwi || fx + tw > mx + mw - bwi ||
+        fy < my + bwi || fy + th > my + mh - bwi) {
+        fx = bx;
+        fy = by;
+    }
 
-    set_client_monitor(c, mon_at_win(c->w));
-    int m = c->mon;
-    c->cx = (float)fx + canvas.pan_x[m];
-    c->cy = (float)fy + canvas.pan_y[m];
+    client_move(c, fx, fy);
+    client_anchor(c);
 }
 
 void win_fs(const Arg arg) {
@@ -1824,18 +2204,19 @@ void win_fs(const Arg arg) {
 
     xcb_query_pointer_reply_t *ptr = xcb_query_pointer_reply(conn, xcb_query_pointer(conn, root), NULL);
     int mx = 0, my = 0, mw = sw, mh = sh;
+    int pmon = 0;
     if (ptr) {
-        int m = mon_from_point(ptr->root_x, ptr->root_y);
-        if (m < n_mons) { mx = mons[m].x; my = mons[m].y; mw = mons[m].w; mh = mons[m].h; }
+        pmon = mon_from_point(ptr->root_x, ptr->root_y);
+        if (pmon < n_mons) { mx = mons[pmon].x; my = mons[pmon].y; mw = mons[pmon].w; mh = mons[pmon].h; }
         free(ptr);
     }
 
+    if (cur->f) set_client_monitor(cur, pmon);
     cur->f = !cur->f;
 
     if (cur->f) {
 	if (xf_bar_ok) {
-		xf_fs_confine(mx, my + (cfg->titlebar ? TITLEBAR_HEIGHT : 0),
-			      mw, mh - (cfg->titlebar ? TITLEBAR_HEIGHT : 0));
+		xf_fs_confine(mx, my, mw, mh);
 		fs_grab_win = cur->w;
 	} else {
 		xcb_grab_pointer_cookie_t gck = xcb_grab_pointer(conn, 1, root,
@@ -1852,19 +2233,19 @@ void win_fs(const Arg arg) {
         } else {
             resizeclient(cur, mw, mh);
             client_move(cur, mx, my);
-
         }
-	snprintf(buf, sizeof(buf), "%s: Fulscreen", win_title ? win_title : "");
+
+	snprintf(buf, sizeof(buf), "%s: Fullscreen", win_title ? win_title : "");
         if (cur->titlebar) titlebar_update(cur);
         if (!cfg->titlebar && cur->titlebar) xcb_unmap_window(conn, cur->titlebar);
         uint32_t stack = XCB_STACK_MODE_ABOVE;
         xcb_configure_window(conn, cur->w, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
     } else {
-	if (xf_bar_ok) {
-		if (fs_grab_win == cur->w) { xf_fs_unconfine(); fs_grab_win = XCB_NONE; }
-	} else if (fs_grab_win == cur->w) {
-		xcb_ungrab_pointer(conn, XCB_CURRENT_TIME); fs_grab_win = XCB_NONE;
-	}
+        if (xf_bar_ok) {
+            if (fs_grab_win == cur->w) { xf_fs_unconfine(); fs_grab_win = XCB_NONE; }
+        } else if (fs_grab_win == cur->w) {
+            xcb_ungrab_pointer(conn, XCB_CURRENT_TIME); fs_grab_win = XCB_NONE;
+        }
         resizeclient(cur, (int)cur->ww, (int)cur->wh);
         client_move(cur, cur->wx, cur->wy);
 	snprintf(buf, sizeof(buf), "%s: Floating", win_title ? win_title : "");
@@ -1877,6 +2258,8 @@ void win_fs(const Arg arg) {
         uint32_t stack = XCB_STACK_MODE_ABOVE;
         xcb_configure_window(conn, cur->w, XCB_CONFIG_WINDOW_STACK_MODE, &stack);
     }
+
+    client_anchor(cur);
 
     docks_raise();
     notify_show(buf, 0x202020);
@@ -1937,12 +2320,17 @@ void configure_request(xcb_configure_request_event_t *e) {
             int m = c->mon;
             sx = canvas_to_screen(c->cx, canvas.pan_x[m]);
             sy = canvas_to_screen(c->cy, canvas.pan_y[m]);
-            mask |= XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y;
             break;
         }
     }
 
-    uint32_t values[7];
+    mask &= (XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+             XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
+             XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE);
+    if (!mask) return;
+    if (target) mask |= XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y;
+
+    uint32_t values[6];
     int i = 0;
     if (mask & XCB_CONFIG_WINDOW_X)            values[i++] = (uint32_t)sx;
     if (mask & XCB_CONFIG_WINDOW_Y)            values[i++] = (uint32_t)sy;
@@ -1955,11 +2343,15 @@ void configure_request(xcb_configure_request_event_t *e) {
     if (target && target->titlebar) {
         unsigned int tw = 0, th = 0;
         win_size(target->w, NULL, NULL, &tw, &th);
-        uint32_t tv[4] = { (uint32_t)sx, (uint32_t)(sy - TITLEBAR_HEIGHT), tw, TITLEBAR_HEIGHT };
+        int bwi = (int)wborder();
+        uint32_t tv[4] = { (uint32_t)sx, (uint32_t)(sy - TITLEBAR_HEIGHT),
+                           (uint32_t)((int)tw + 2 * bwi), TITLEBAR_HEIGHT };
         xcb_configure_window(conn, target->titlebar,
             XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, tv);
         titlebar_update(target);
     }
+
+    if (target) canvas_clip_client(target);
     docks_raise();
     xcb_flush(conn);
 }
@@ -2006,19 +2398,22 @@ void expose_event(xcb_expose_event_t *e) {
     xcb_window_t w = e->window;
 
     if (icons_redraw_win(w)) return;
+    if (sbcs_redraw(e)) return;
 
     client *c = client_from_titlebar(w);
     if (c) { titlebar_update(c); return; }
 }
 
+static void manage_win(xcb_window_t w, xcb_window_t transient_for);
+
 void map_request(xcb_map_request_event_t *e) {
     xcb_window_t w = e->window;
- 
+
     xcb_get_window_attributes_reply_t *wa =
         xcb_get_window_attributes_reply(conn, xcb_get_window_attributes(conn, w), NULL);
     if (!wa || wa->override_redirect) { free(wa); return; }
     free(wa);
- 
+
     if (win_is_dock(w)) {
         update_struts(w);
         dock_add(w);
@@ -2026,14 +2421,14 @@ void map_request(xcb_map_request_event_t *e) {
         xcb_flush(conn);
         return;
     }
- 
+
     for win
         if (c->w == w) { xcb_map_window(conn, w); docks_raise(); xcb_flush(conn); return; }
- 
- 
+
+
     xcb_window_t transient_for = XCB_NONE;
     xcb_icccm_get_wm_transient_for_reply(conn, xcb_icccm_get_wm_transient_for(conn, w), &transient_for, NULL);
- 
+
     static xcb_atom_t skip_types[7];
     static int skip_types_inited = 0;
     if (!skip_types_inited) {
@@ -2046,7 +2441,7 @@ void map_request(xcb_map_request_event_t *e) {
         skip_types[6] = get_atom("_NET_WM_WINDOW_TYPE_MENU");
         skip_types_inited = 1;
     }
- 
+
     xcb_get_property_cookie_t ck = xcb_get_property(conn, 0, w, net_wm_window_type, XCB_ATOM_ATOM, 0, 1);
     xcb_get_property_reply_t *r = xcb_get_property_reply(conn, ck, NULL);
     if (r && xcb_get_property_value_length(r) > 0) {
@@ -2062,21 +2457,27 @@ void map_request(xcb_map_request_event_t *e) {
         }
     }
     free(r);
- 
-    uint32_t evmask = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_ENTER_WINDOW |
-                       XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_FOCUS_CHANGE;
-    xcb_change_window_attributes(conn, w, XCB_CW_EVENT_MASK, &evmask);
- 
+
+    manage_win(w, transient_for);
+}
+
+static void manage_win(xcb_window_t w, xcb_window_t transient_for) {
+    if (w != sbcs_win) {
+        uint32_t evmask = XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_ENTER_WINDOW |
+                           XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_FOCUS_CHANGE;
+        xcb_change_window_attributes(conn, w, XCB_CW_EVENT_MASK, &evmask);
+    }
+
     uint32_t bw = wborder();
     xcb_configure_window(conn, w, XCB_CONFIG_WINDOW_BORDER_WIDTH, &bw);
- 
+
     int nx = 0, ny = 0; unsigned int nw = 0, nh = 0;
     win_size(w, &nx, &ny, &nw, &nh);
     win_add(w);
- 
+
     client *oc = cur;
     cur = list->prev;
- 
+
     if (transient_for != XCB_NONE) {
         int px = 0, py = 0; unsigned int pw = 0, ph = 0;
         win_size(transient_for, &px, &py, &pw, &ph);
@@ -2084,23 +2485,30 @@ void map_request(xcb_map_request_event_t *e) {
             int cx = px + ((int)pw - (int)nw) / 2;
             int cy = py + ((int)ph - (int)nh) / 2;
             client_move(cur, cx, cy);
+            client_anchor(cur);
         } else if (nx + ny == 0) {
             win_place_free(cur);
         }
     } else if (nx + ny == 0) {
         win_place_free(cur);
     }
- 
- 
+
+
     if (cur->titlebar) titlebar_update(cur);
- 
+
     xcb_map_window(conn, w);
     cur = oc;
     win_focus(list->prev);
     docks_raise();
     xcb_flush(conn);
 }
- 
+
+void sbcs_manage(xcb_window_t w) {
+    if (w == XCB_NONE) return;
+    for win if (c->w == w) { focus_win_id(w); return; }
+    manage_win(w, XCB_NONE);
+}
+
 void mapping_notify(xcb_mapping_notify_event_t *e) {
     if (e->request == XCB_MAPPING_KEYBOARD || e->request == XCB_MAPPING_MODIFIER) {
         xcb_refresh_keyboard_mapping(keysyms, e);
@@ -2112,8 +2520,46 @@ void run(const Arg arg) {
     if (fork()) return;
     if (conn) close(xcb_get_file_descriptor(conn));
     setsid();
-    execvp((char *)arg.com[0], (char **)arg.com);
-    exit(1);
+
+    if (cfg && cfg->defaultsh && cfg->defaultsh[0] && arg.com && arg.com[0]) {
+        static const char prelude[] =
+            "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; "
+            "[ -n \"$DBUS_SESSION_BUS_ADDRESS\" ] || "
+            "{ [ -S \"$XDG_RUNTIME_DIR/bus\" ] && "
+            "  export DBUS_SESSION_BUS_ADDRESS=\"unix:path=$XDG_RUNTIME_DIR/bus\"; }; ";
+        const char *sh = cfg->defaultsh;
+        int single = arg.com[1] == NULL;
+        size_t avail = sizeof(prelude);
+        for (int i = 0; arg.com[i]; i++)
+            avail += single ? strlen(arg.com[i]) + 1 : strlen(arg.com[i]) * 4 + 4;
+        char *cmd = malloc(avail);
+        if (cmd) {
+            char *p = cmd;
+            memcpy(p, prelude, sizeof(prelude) - 1);
+            p += sizeof(prelude) - 1;
+            if (single) {
+                size_t n = strlen(arg.com[0]);
+                memcpy(p, arg.com[0], n);
+                p += n;
+            } else {
+                for (int i = 0; arg.com[i]; i++) {
+                    const char *s = arg.com[i];
+                    if (i) *p++ = ' ';
+                    *p++ = '\'';
+                    while (*s) {
+                        if (*s == '\'') *p++ = '\'';
+                        *p++ = *s++;
+                    }
+                    *p++ = '\'';
+                }
+            }
+            *p = '\0';
+            char *const argv[] = { (char *)sh, "-l", "-c", cmd, NULL };
+            execvp(sh, argv);
+            free(cmd);
+        }
+    }
+    _exit(1);
 }
 
 void quit(const Arg arg) {
@@ -2175,16 +2621,15 @@ static void notify_cleanup(void) {
     }
 }
 
-void reload_config(const Arg arg) {
-    (void)arg;
+int reload_config_quiet(int announce) {
     char cfgdir[256];
     snprintf(cfgdir, sizeof(cfgdir), "%s/.config/sbcwm/config.lua", get_home());
 
     Config *new_cfg = config_load(cfgdir);
     if (!new_cfg) {
         fprintf(stderr, "sbpcwm: failed to reload config\n");
-        notify_show("Config failed", 0x202020);
-        return;
+        if (announce) notify_show("Config failed", 0x202020);
+        return -1;
     }
 
     Config *old_cfg = cfg;
@@ -2192,11 +2637,32 @@ void reload_config(const Arg arg) {
     input_grab(root);
     if (strcmp(old_cfg->fonts, new_cfg->fonts) || strcmp(old_cfg->fontb, new_cfg->fontb))
         fonts_reload();
+
+    char old_bg[64], old_bd[64], old_deco[64];
+    snprintf(old_bg,   sizeof old_bg,   "%s", old_cfg->ctxbg    ? old_cfg->ctxbg    : "");
+    snprintf(old_bd,   sizeof old_bd,   "%s", old_cfg->ctxborder ? old_cfg->ctxborder : "");
+    snprintf(old_deco, sizeof old_deco, "%s", old_cfg->deco      ? old_cfg->deco      : "");
     config_free(old_cfg);
+
     icons_load_state(cfg);
-    icons_rebuild();
+
+    if (strcmp(old_bg,   cfg->ctxbg    ? cfg->ctxbg    : "") ||
+        strcmp(old_bd,   cfg->ctxborder ? cfg->ctxborder : "") ||
+        strcmp(old_deco, cfg->deco      ? cfg->deco      : ""))
+        apply_colors();
+    else {
+        icons_rebuild();
+        sbcs_refresh();
+    }
+
     xcb_flush(conn);
-    notify_show("Config reloaded", 0x202020);
+    if (announce) notify_show("Config reloaded", 0x202020);
+    return 0;
+}
+
+void reload_config(const Arg arg) {
+    (void)arg;
+    reload_config_quiet(1);
 }
 
 void input_grab(xcb_window_t rootw) {
@@ -2309,9 +2775,7 @@ void move_nextmon(const Arg arg) {
 
     client_move(cur, new_sx, new_sy);
     titlebar_update(cur);
-
-    cur->cx = (float)new_sx + canvas.pan_x[next];
-    cur->cy = (float)new_sy + canvas.pan_y[next];
+    client_anchor(cur);
 
     xcb_flush(conn);
 }
@@ -2421,6 +2885,9 @@ int main(void) {
         xcb_randr_select_input(conn, root, XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE);
     }
 
+    const xcb_query_extension_reply_t *shape_ext = xcb_get_extension_data(conn, &xcb_shape_id);
+    shape_ok = shape_ext && shape_ext->present;
+
     monitors_refresh();
     canvas_sync_to_root();
 
@@ -2444,7 +2911,7 @@ int main(void) {
                          XCB_ATOM_WINDOW, 32, 1, &wmcheck);
     xcb_change_property(conn, XCB_PROP_MODE_REPLACE, wmcheck, net_wm_name,
                          ewmh_utf8_string, 8, 6, "sbpcwm");
- 
+
     xcb_atom_t supported[] = {
         net_supporting_wm_check, net_wm_name, net_wm_window_type,
         net_wm_window_type_dock, net_wm_strut, net_wm_strut_partial,
@@ -2491,7 +2958,7 @@ int main(void) {
     input_grab(root);
 
     icons_load_state(cfg);
-    if (cfg->ui) icons_rebuild();
+    icons_rebuild();
 
     xcb_flush(conn);
 
@@ -2509,7 +2976,13 @@ int main(void) {
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
 
-        int pr = poll(pfds, pfds[1].fd >= 0 ? 2 : 1, 16);
+        int timeout = 16;
+        if (layout_dirty || drag_dirty || resize_dirty) {
+            long left = FRAME_MIN_MS - (now_ms() - frame_last_ms);
+            timeout = left > 0 ? (int)left : 0;
+        }
+
+        int pr = poll(pfds, pfds[1].fd >= 0 ? 2 : 1, timeout);
         if (pr < 0) {
             if (errno == EINTR) continue;
             break;
@@ -2526,10 +2999,12 @@ int main(void) {
         }
 
         physics_tick();
+        apply_pending();
         notify_cleanup();
     }
 
     ctl_cleanup();
+    sbcs_cleanup();
 
     return 0;
 }

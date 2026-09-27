@@ -1,6 +1,4 @@
 
-/* Sowm C Binding Lua config */
-
 #include <X11/X.h>
 #include <X11/Xlib.h>
 #include <lua5.3/lua.h>
@@ -200,8 +198,7 @@ Config *config_load(const char *path) {
 
     cfg->pan_step     = 120;
     cfg->titlebar     = 0;
-    cfg->ui           = 1;
-    cfg->xr_colors    = 1;
+    cfg->focus_follow = 0;
     cfg->border       = 1;
     cfg->border_width = 1;
     cfg->defaultsh    = dupstr("/bin/sh");
@@ -209,6 +206,7 @@ Config *config_load(const char *path) {
     cfg->fontb        = dupstr("FiraMonoNerdFont:style=Regular:pixelsize=20:antialias=false");
     cfg->ctxbg        = NULL;
     cfg->ctxborder    = NULL;
+    cfg->deco         = NULL;
     cfg->shortcuts    = NULL;
     cfg->nshortcuts   = 0;
     cfg->icons        = NULL;
@@ -218,14 +216,15 @@ Config *config_load(const char *path) {
     if (lua_istable(L, -1)) {
         cfg->pan_step     = (uint32_t)opt_int(L, "pan_step",     120);
         cfg->titlebar     = (uint8_t)opt_int(L,  "titlebar",     0);
-        cfg->ui           = (uint8_t)opt_int(L,  "ui",           1);
-        cfg->xr_colors    = (uint8_t)opt_int(L,  "xr_colors",    1);
+        cfg->focus_follow = (uint8_t)opt_int(L,  "focus_follow", 0);
         cfg->border       = (uint8_t)opt_int(L,  "border",       1);
         cfg->border_width = (uint16_t)opt_int(L, "border_width", 1);
         const char *cbg = opt_str(L, "ctxbg", NULL);
         if (cbg) cfg->ctxbg = dupstr(cbg);
         const char *cbd = opt_str(L, "ctxborder", NULL);
         if (cbd) cfg->ctxborder = dupstr(cbd);
+        const char *dec = opt_str(L, "deco", NULL);
+        if (dec) cfg->deco = dupstr(dec);
     }
     lua_pop(L, 1);
 
@@ -380,6 +379,70 @@ void config_load_icons(const char *path, Config *c) {
     lua_close(L);
 }
 
+void config_apply_icon_state(const char *path, Config *c) {
+    if (!c || !c->icons || c->nicons <= 0) return;
+
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+    if (luaL_dofile(L, path) != LUA_OK) {
+        lua_close(L);
+        return;
+    }
+
+    lua_getglobal(L, "icons");
+    if (lua_istable(L, -1)) {
+        int n = lua_rawlen(L, -1);
+        unsigned char *hit = calloc((size_t)c->nicons, 1);
+        if (!hit) { lua_close(L); return; }
+
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 1; i <= n; i++) {
+                lua_rawgeti(L, -1, i);
+                int idx = lua_gettop(L);
+
+                int x = c->icons[0].x, y = c->icons[0].y, mon = c->icons[0].mon;
+                lua_getfield(L, idx, "x");
+                if (lua_isnumber(L, -1)) x = (int)lua_tonumber(L, -1);
+                lua_pop(L, 1);
+                lua_getfield(L, idx, "y");
+                if (lua_isnumber(L, -1)) y = (int)lua_tonumber(L, -1);
+                lua_pop(L, 1);
+                lua_getfield(L, idx, "mon");
+                if (lua_isnumber(L, -1)) mon = (int)lua_tonumber(L, -1);
+                lua_pop(L, 1);
+
+                int t = -1;
+                if (pass == 0) {
+                    lua_getfield(L, idx, "name");
+                    const char *nm = lua_tostring(L, -1);
+                    if (nm)
+                        for (int j = 0; j < c->nicons; j++)
+                            if (c->icons[j].name && !strcmp(c->icons[j].name, nm)) {
+                                t = j;
+                                break;
+                            }
+                    lua_pop(L, 1);
+                } else {
+
+                    t = i - 1;
+                }
+
+                if (t >= 0 && t < c->nicons && !hit[t]) {
+                    hit[t] = 1;
+                    c->icons[t].x = x;
+                    c->icons[t].y = y;
+                    c->icons[t].mon = mon;
+                }
+
+                lua_pop(L, 1);
+            }
+        }
+        free(hit);
+    }
+    lua_pop(L, 1);
+    lua_close(L);
+}
+
 void config_free(Config *cfg) {
     if (!cfg) return;
     free(cfg->defaultsh);
@@ -404,6 +467,7 @@ void config_free(Config *cfg) {
     free(cfg->ctx);
     free(cfg->ctxbg);
     free(cfg->ctxborder);
+    free(cfg->deco);
     for (int i = 0; i < cfg->nshortcuts; i++) {
         for (int j = 0; j < cfg->shortcuts[i].ncmd; j++)
             free(cfg->shortcuts[i].cmd[j]);

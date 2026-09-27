@@ -6,12 +6,12 @@ fontb = "FiraMonoNerdFont:style=Regular:pixelsize=20:antialias=false"
 opts = {
   pan_step = 120,
   titlebar = 0,
-  ui = 1,
-  xr_colors = 1,
+  focus_follow = 0,
   border = 1,
   border_width = 1,
   ctxbg = "#151515",
   ctxborder = "#2d4d66",
+  deco = "#2d4d66",
 }
 
 ctx = {

@@ -18,9 +18,13 @@
 #include "sbpcwm.h"
 #include "icons.h"
 
-#define ICON_SIZE 100
-#define ICON_IMG   72
-#define ICON_GAP   14
+#define ICON_CELL_W  132
+#define ICON_IMG      72
+#define ICON_TOP       6
+#define ICON_LAB_PAD   5
+#define ICON_LAB_TOP   3
+#define ICON_LAB_BOT   5
+#define ICON_MAX_LINES 2
 #define ICON_DRAG_THRESHOLD 5
 #define ICON_DOUBLE_CLICK_MS 400
 
@@ -30,8 +34,20 @@ typedef struct {
 } IconImg;
 
 typedef struct {
+    int off, len;
+} LabelChunk;
+
+typedef struct {
+    int        nlines;
+    int        ellipsis;
+    int        w, h, lh;
+    LabelChunk line[ICON_MAX_LINES];
+} LabelLayout;
+
+typedef struct {
     xcb_window_t iw;
     IconImg     *img;
+    LabelLayout lab;
 } IconSlot;
 
 static IconSlot *slots  = NULL;
@@ -277,6 +293,52 @@ static void img_scale(uint32_t *dst, int dw, int dh,
 static Visual   *argb_visual = NULL;
 static Colormap  argb_cmap   = 0;
 
+int icons_draw_thumb(Drawable d, const char *path, int x, int y,
+                     int w, int h, unsigned long bg) {
+    if (!path || !*path || w <= 0 || h <= 0) return 0;
+    IconImg *img = img_load(path);
+    if (!img || img->w <= 0 || img->h <= 0) {
+        if (img) img_free(img);
+        return 0;
+    }
+
+    uint32_t *buf = calloc((size_t)w * h, sizeof(uint32_t));
+    if (!buf) { img_free(img); return 0; }
+
+    double scale = MIN((double)w / img->w, (double)h / img->h);
+    if (scale > 1) scale = 1;
+    int dw = (int)(img->w * scale), dh = (int)(img->h * scale);
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    img_scale(buf + (size_t)((h - dh) / 2) * w + (w - dw) / 2, dw, dh,
+              img->px, img->w, img->h);
+    img_free(img);
+
+    unsigned long r0 = (bg >> 16) & 0xff, g0 = (bg >> 8) & 0xff, b0 = bg & 0xff;
+    for (int i = 0; i < w * h; i++) {
+        uint32_t c = buf[i];
+        unsigned a = c >> 24 & 0xff;
+        if (a == 0xff) continue;
+        unsigned r = c >> 16 & 0xff, g = c >> 8 & 0xff, b = c & 0xff;
+        if (a == 0) { buf[i] = (uint32_t)(0xff000000u | (r0 << 16) | (g0 << 8) | b0); continue; }
+        r += (unsigned)(r0 * (255 - a) / 255);
+        g += (unsigned)(g0 * (255 - a) / 255);
+        b += (unsigned)(b0 * (255 - a) / 255);
+        buf[i] = (uint32_t)(0xff000000u | (CLAMP((int)r, 0, 255) << 16) |
+                            (CLAMP((int)g, 0, 255) << 8) | CLAMP((int)b, 0, 255));
+    }
+
+    XImage *xi = XCreateImage(dpy, visual, depth, ZPixmap, 0, (char *)buf,
+                              (unsigned)w, (unsigned)h, 32, 0);
+    if (!xi) { free(buf); return 0; }
+    xi->byte_order = ImageByteOrder(dpy);
+    GC gc = XCreateGC(dpy, d, 0, NULL);
+    XPutImage(dpy, d, gc, xi, 0, 0, (int)x, (int)y, (unsigned)w, (unsigned)h);
+    XFreeGC(dpy, gc);
+    XDestroyImage(xi);
+    return 1;
+}
+
 static void find_argb_visual(void) {
     if (argb_visual) return;
     xcb_depth_iterator_t dit = xcb_screen_allowed_depths_iterator(screen);
@@ -311,50 +373,168 @@ static uint32_t icon_px(const uint8_t *data, int stride, int x, int y, int lsb) 
            ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static void icon_apply_shape(xcb_window_t iw, const uint32_t *scaled, const LauncherIcon *ic) {
+static int utf8_len(const char *s) {
+    unsigned char c = (unsigned char)*s;
+    if (c < 0x80) return 1;
+    if ((c & 0xe0) == 0xc0) return 2;
+    if ((c & 0xf0) == 0xe0) return 3;
+    if ((c & 0xf8) == 0xf0) return 4;
+    return 1;
+}
+
+static int utf8_back(const char *s, int n) {
+    int i = n - 1;
+    while (i > 0 && ((unsigned char)s[i] & 0xc0) == 0x80) i--;
+    return n - i;
+}
+
+static int utf8_is_break(char c) {
+    return c == ' ' || c == '-';
+}
+
+static int text_w(XftFont *f, const char *s, int len) {
+    if (!f || len <= 0) return 0;
+    XGlyphInfo ext;
+    XftTextExtentsUtf8(dpy, f, (const FcChar8 *)s, len, &ext);
+    return (int)ext.xOff;
+}
+
+static XftFont *icon_font = NULL;
+static char     *icon_font_name = NULL;
+
+static XftFont *label_font(void) {
+    const char *want = cfg ? cfg->fonts : NULL;
+    if (icon_font && want && icon_font_name && !strcmp(want, icon_font_name)) return icon_font;
+    if (icon_font) { XftFontClose(dpy, icon_font); icon_font = NULL; }
+    free(icon_font_name);
+    icon_font_name = NULL;
+    if (want) {
+        icon_font = open_font(want);
+        if (icon_font) icon_font_name = copystr(want);
+    }
+    return icon_font;
+}
+
+static void label_layout(LabelLayout *L, const char *name) {
+    memset(L, 0, sizeof *L);
+    L->w = ICON_CELL_W;
+
+    XftFont *f = label_font();
+    L->lh = f ? f->ascent + f->descent : 16;
+    if (L->lh < 1) L->lh = 1;
+
+    int n = name ? (int)strlen(name) : 0;
+    L->nlines = 1;
+    L->line[0].off = 0;
+    L->line[0].len = n;
+
+    if (f && n > 0) {
+        int maxw = L->w - 2 * ICON_LAB_PAD;
+        if (text_w(f, name, n) > maxw) {
+            L->nlines = 0;
+            int start = 0;
+            while (start < n && L->nlines < ICON_MAX_LINES) {
+                int end = start, brk = -1;
+                while (end < n) {
+                    int clen = utf8_len(name + end);
+                    if (end + clen > n) clen = n - end;
+                    if (end > start &&
+                        text_w(f, name + start, end + clen - start) > maxw) break;
+                    if (utf8_is_break(name[end])) brk = end;
+                    end += clen;
+                }
+                if (end < n && brk > start) end = brk;
+                int len = end - start;
+                while (len > 0 && name[start + len - 1] == ' ') len--;
+                L->line[L->nlines].off = start;
+                L->line[L->nlines].len = len;
+                L->nlines++;
+                start = end;
+                while (start < n && name[start] == ' ') start++;
+            }
+            if (start < n) L->ellipsis = 1;
+        }
+    }
+    if (L->nlines < 1) L->nlines = 1;
+
+    L->h = ICON_TOP + ICON_IMG + ICON_LAB_TOP + L->nlines * L->lh + ICON_LAB_BOT;
+}
+
+static void label_line_draw(XftDraw *draw, XftFont *f, const XftColor *color,
+                            const char *s, int len, int ellipsis, int ellw,
+                            int cell_w, int ybase) {
+    char buf[256];
+    const char *str = s;
+    int slen = len;
+
+    if (ellipsis) {
+        int maxw = cell_w - 2 * ICON_LAB_PAD;
+        int n = len;
+        if (n > (int)sizeof buf - 4) n = (int)sizeof buf - 4;
+        memcpy(buf, s, (size_t)n);
+        buf[n] = 0;
+        while (n > 0 && text_w(f, buf, n) + ellw > maxw) n -= utf8_back(buf, n);
+        memcpy(buf + n, "...", 4);
+        str = buf;
+        slen = n + 3;
+    }
+
+    int x = (cell_w - text_w(f, str, slen)) / 2;
+    if (x < 0) x = 0;
+    XftDrawStringUtf8(draw, color, f, x, ybase, (const FcChar8 *)str, slen);
+}
+
+static void label_draw(Drawable d, Visual *vis, Colormap cm,
+                       const char *name, const LabelLayout *L) {
+    if (!name || !name[0] || L->nlines < 1) return;
+    XftDraw *draw = XftDrawCreate(dpy, d, vis, cm);
+    if (!draw) return;
+    XftFont *f = label_font();
+    if (f) {
+        XftColor color;
+
+        xcolor_to_xftcolor(cols.icon_text, &color);
+        int ellw = text_w(f, "...", 3);
+        int y0 = ICON_TOP + ICON_IMG + ICON_LAB_TOP + f->ascent;
+        for (int i = 0; i < L->nlines; i++) {
+            int last = (i == L->nlines - 1);
+            label_line_draw(draw, f, &color, name + L->line[i].off, L->line[i].len,
+                            last && L->ellipsis, ellw, L->w, y0 + i * L->lh);
+        }
+        XftColorFree(dpy, vis, cm, &color);
+    }
+    XftDrawDestroy(draw);
+}
+
+static void icon_apply_shape(xcb_window_t iw, const uint32_t *scaled,
+                             const char *name, const LabelLayout *L) {
     find_argb_visual();
     if (!argb_visual) return;
 
+    int iw_w = L->w, iw_h = L->h;
+    int ix = (iw_w - ICON_IMG) / 2;
+    if (ix < 0) ix = 0;
+
     xcb_pixmap_t pm = xcb_generate_id(conn);
-    xcb_create_pixmap(conn, 32, pm, root, ICON_SIZE, ICON_SIZE);
+    xcb_create_pixmap(conn, 32, pm, root, (uint16_t)iw_w, (uint16_t)iw_h);
     xcb_gcontext_t gc = xcb_generate_id(conn);
     xcb_create_gc(conn, gc, pm, 0, NULL);
     uint32_t zero = 0;
     xcb_change_gc(conn, gc, XCB_GC_FOREGROUND, &zero);
-    xcb_rectangle_t full = { 0, 0, ICON_SIZE, ICON_SIZE };
+    xcb_rectangle_t full = { 0, 0, (uint16_t)iw_w, (uint16_t)iw_h };
     xcb_poly_fill_rectangle(conn, pm, gc, 1, &full);
     xcb_put_image(conn, XCB_IMAGE_FORMAT_Z_PIXMAP, pm, gc,
-                  ICON_IMG, ICON_IMG, ICON_GAP, 6, 0, 32,
+                  ICON_IMG, ICON_IMG, (int16_t)ix, ICON_TOP, 0, 32,
                   sizeof(uint32_t) * (size_t)ICON_IMG * ICON_IMG,
                   (const uint8_t *)scaled);
     xcb_free_gc(conn, gc);
     xcb_flush(conn);
 
-    if (ic && ic->name && ic->name[0]) {
-        XftDraw *draw = XftDrawCreate(dpy, pm, argb_visual, argb_cmap);
-        if (draw) {
-            XftFont *f = open_font(cfg->fonts);
-            if (f) {
-                XftColor color;
-                xcolor_to_xftcolor(cols.foreground, &color);
-                XGlyphInfo ext;
-                XftTextExtentsUtf8(dpy, f, (const FcChar8 *)ic->name,
-                                   (int)strlen(ic->name), &ext);
-                int nx = (ICON_SIZE - ext.xOff) / 2;
-                if (nx < 0) nx = 0;
-                int ny = ICON_SIZE - 8 + (f->ascent - f->descent) / 2;
-                XftDrawStringUtf8(draw, &color, f, nx, ny,
-                                  (const FcChar8 *)ic->name, (int)strlen(ic->name));
-                XftColorFree(dpy, argb_visual, argb_cmap, &color);
-                XftFontClose(dpy, f);
-            }
-            XftDrawDestroy(draw);
-        }
-    }
+    label_draw((Drawable)pm, argb_visual, argb_cmap, name, L);
     XFlush(dpy);
 
     xcb_get_image_cookie_t ck = xcb_get_image(conn, XCB_IMAGE_FORMAT_Z_PIXMAP, pm,
-                                              0, 0, ICON_SIZE, ICON_SIZE, ~0u);
+                                              0, 0, (uint16_t)iw_w, (uint16_t)iw_h, ~0u);
     xcb_get_image_reply_t *rep = xcb_get_image_reply(conn, ck, NULL);
     if (!rep) {
         xcb_free_pixmap(conn, pm);
@@ -362,17 +542,17 @@ static void icon_apply_shape(xcb_window_t iw, const uint32_t *scaled, const Laun
     }
 
     const uint8_t *data = xcb_get_image_data(rep);
-    int stride = ICON_SIZE * 4;
+    int stride = iw_w * 4;
     int lsb = xcb_get_setup(conn)->image_byte_order == XCB_IMAGE_ORDER_LSB_FIRST;
 
     xcb_rectangle_t *rects = malloc(sizeof(xcb_rectangle_t) *
-                                    ((size_t)ICON_SIZE * ICON_SIZE / 2 + ICON_SIZE));
+                                    ((size_t)iw_w * iw_h / 2 + iw_h));
     int nr = 0;
-    for (int y = 0; y < ICON_SIZE; y++) {
-        for (int x = 0; x < ICON_SIZE; ) {
+    for (int y = 0; y < iw_h; y++) {
+        for (int x = 0; x < iw_w; ) {
             if (((icon_px(data, stride, x, y, lsb) >> 24) & 0xff) >= 1) {
                 int x0 = x;
-                while (x < ICON_SIZE &&
+                while (x < iw_w &&
                        ((icon_px(data, stride, x, y, lsb) >> 24) & 0xff) >= 1)
                     x++;
                 rects[nr].x = (int16_t)x0;
@@ -387,7 +567,7 @@ static void icon_apply_shape(xcb_window_t iw, const uint32_t *scaled, const Laun
     }
 
     xcb_pixmap_t mask = xcb_generate_id(conn);
-    xcb_create_pixmap(conn, 1, mask, iw, ICON_SIZE, ICON_SIZE);
+    xcb_create_pixmap(conn, 1, mask, iw, (uint16_t)iw_w, (uint16_t)iw_h);
     xcb_gcontext_t mgc = xcb_generate_id(conn);
     xcb_create_gc(conn, mgc, mask, 0, NULL);
     xcb_change_gc(conn, mgc, XCB_GC_FOREGROUND, &zero);
@@ -408,13 +588,18 @@ static void icon_apply_shape(xcb_window_t iw, const uint32_t *scaled, const Laun
     xcb_flush(conn);
 }
 
-static void icon_draw(xcb_window_t iw, const LauncherIcon *ic, const IconImg *img) {
+static void icon_draw(xcb_window_t iw, const LauncherIcon *ic,
+                      const IconImg *img, const LabelLayout *L) {
+    int iw_w = L->w, iw_h = L->h;
+    int ix = (iw_w - ICON_IMG) / 2;
+    if (ix < 0) ix = 0;
+
     xcb_gcontext_t gc = xcb_generate_id(conn);
     xcb_create_gc(conn, gc, iw, 0, NULL);
 
-    uint32_t bg = cfg->ctxbg ? (uint32_t)hex_to_xcolor(cfg->ctxbg) : (uint32_t)cols.background;
+    uint32_t bg = (uint32_t)cols.background;
     xcb_change_gc(conn, gc, XCB_GC_FOREGROUND, &bg);
-    xcb_rectangle_t r = { 0, 0, ICON_SIZE, ICON_SIZE };
+    xcb_rectangle_t r = { 0, 0, (uint16_t)iw_w, (uint16_t)iw_h };
     xcb_poly_fill_rectangle(conn, iw, gc, 1, &r);
     xcb_free_gc(conn, gc);
 
@@ -449,7 +634,7 @@ static void icon_draw(xcb_window_t iw, const LauncherIcon *ic, const IconImg *im
             XRenderPictFormat *argbfmt = XRenderFindStandardFormat(dpy, PictStandardARGB32);
             Picture imgpic = XRenderCreatePicture(dpy, pm, argbfmt, 0, NULL);
             XRenderComposite(dpy, PictOpOver, imgpic, None, winpic,
-                             0, 0, 0, 0, ICON_GAP, 6, ICON_IMG, ICON_IMG);
+                             0, 0, 0, 0, ix, ICON_TOP, ICON_IMG, ICON_IMG);
             XRenderFreePicture(dpy, imgpic);
             XFlush(dpy);
             xcb_free_pixmap(conn, pm);
@@ -457,72 +642,59 @@ static void icon_draw(xcb_window_t iw, const LauncherIcon *ic, const IconImg *im
         }
     }
 
-    if (ic && ic->name && ic->name[0]) {
-        XftDraw *draw = XftDrawCreate(dpy, iw, visual, cmap);
-        XftFont *f = open_font(cfg->fonts);
-        if (f) {
-            XftColor color;
-            xcolor_to_xftcolor(cols.foreground, &color);
-            XGlyphInfo ext;
-            XftTextExtentsUtf8(dpy, f, (const FcChar8 *)ic->name,
-                               (int)strlen(ic->name), &ext);
-            int nx = (ICON_SIZE - ext.xOff) / 2;
-            if (nx < 0) nx = 0;
-            int ny = ICON_SIZE - 8 + (f->ascent - f->descent) / 2;
-            XftDrawStringUtf8(draw, &color, f, nx, ny,
-                              (const FcChar8 *)ic->name, (int)strlen(ic->name));
-            XftColorFree(dpy, visual, cmap, &color);
-            XftFontClose(dpy, f);
-        }
-        XftDrawDestroy(draw);
-    }
+    label_draw((Drawable)iw, visual, cmap, ic ? ic->name : NULL, L);
 
     if (!scaled)
         scaled = calloc((size_t)ICON_IMG * ICON_IMG, sizeof(uint32_t));
-    icon_apply_shape(iw, scaled, ic);
+    icon_apply_shape(iw, scaled, ic ? ic->name : NULL, L);
     free(scaled);
 
     XFlush(dpy);
     xcb_flush(conn);
 }
 
-static int icon_screen_pos(const LauncherIcon *ic, int m, int *sx, int *sy) {
+static int icon_screen_pos(const LauncherIcon *ic, int m, int w, int h,
+                           int *sx, int *sy) {
     if (n_mons <= 0) return 0;
     if (m < 0) m = 0;
     if (m >= n_mons) m = n_mons - 1;
     int mx = mons[m].x, my = mons[m].y, mw = mons[m].w, mh = mons[m].h;
     *sx = (int)(ic->x - canvas.pan_x[m]);
     *sy = (int)(ic->y - canvas.pan_y[m]);
-    if (*sx + ICON_SIZE <= mx || *sx >= mx + mw ||
-        *sy + ICON_SIZE <= my || *sy >= my + mh) {
-        *sx = mx - ICON_SIZE - 8000;
+    if (*sx + w <= mx || *sx >= mx + mw ||
+        *sy + h <= my || *sy >= my + mh) {
+        *sx = mx - w - 8000;
         *sy = my;
     }
     return 1;
 }
 
 static void icon_window_create(int i, const LauncherIcon *ic) {
+    LabelLayout L;
+    label_layout(&L, ic->name);
+
     int sx = 0, sy = 0;
-    if (!icon_screen_pos(ic, ic->mon, &sx, &sy)) return;
+    if (!icon_screen_pos(ic, ic->mon, L.w, L.h, &sx, &sy)) return;
 
     xcb_window_t iw = xcb_generate_id(conn);
     uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_BACKING_STORE |
                     XCB_CW_OVERRIDE_REDIRECT | XCB_CW_EVENT_MASK;
-    uint32_t bg = cfg->ctxbg ? (uint32_t)hex_to_xcolor(cfg->ctxbg) : (uint32_t)cols.background;
+    uint32_t bg = (uint32_t)cols.background;
     uint32_t em = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_BUTTON_PRESS |
                   XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION;
     uint32_t values[] = { bg, XCB_BACKING_STORE_ALWAYS, 1, em };
     xcb_create_window(conn, XCB_COPY_FROM_PARENT, iw, root,
-                      (int16_t)sx, (int16_t)sy, ICON_SIZE, ICON_SIZE, 0,
+                      (int16_t)sx, (int16_t)sy, (uint16_t)L.w, (uint16_t)L.h, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, mask, values);
 
     IconImg *img = img_load(ic->image);
     if (!img && ic->image && ic->image[0])
         fprintf(stderr, "sbpcwm: cannot load icon image '%s'\n", ic->image);
-    icon_draw(iw, ic, img);
+    icon_draw(iw, ic, img, &L);
 
     slots[i].iw = iw;
     slots[i].img = img;
+    slots[i].lab = L;
     xcb_map_window(conn, iw);
     xcb_flush(conn);
 }
@@ -552,6 +724,9 @@ void icons_cleanup(void) {
     slots = NULL;
     n_slots = 0;
     drag_idx = -1;
+    if (icon_font) { XftFontClose(dpy, icon_font); icon_font = NULL; }
+    free(icon_font_name);
+    icon_font_name = NULL;
     if (conn) xcb_flush(conn);
 }
 
@@ -561,7 +736,8 @@ void icons_reposition(void) {
         if (!slots[i].iw) continue;
         LauncherIcon *ic = &cfg->icons[i];
         int sx = 0, sy = 0;
-        if (!icon_screen_pos(ic, ic->mon, &sx, &sy)) continue;
+        if (!icon_screen_pos(ic, ic->mon, slots[i].lab.w, slots[i].lab.h, &sx, &sy))
+            continue;
         uint32_t v[2] = { (uint32_t)sx, (uint32_t)sy };
         xcb_configure_window(conn, slots[i].iw, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, v);
     }
@@ -604,7 +780,7 @@ static int icon_index_for_win(xcb_window_t w) {
 int icons_redraw_win(xcb_window_t w) {
     int i = icon_index_for_win(w);
     if (i < 0 || !slots[i].iw || !cfg) return 0;
-    icon_draw(slots[i].iw, &cfg->icons[i], slots[i].img);
+    icon_draw(slots[i].iw, &cfg->icons[i], slots[i].img, &slots[i].lab);
     return 1;
 }
 
@@ -642,7 +818,8 @@ int icon_handle_motion(xcb_motion_notify_event_t *e) {
     int nsx = drag_sx0 + dx;
     int nsy = drag_sy0 + dy;
 
-    int m = mon_from_point(nsx + ICON_SIZE / 2, nsy + ICON_SIZE / 2);
+    int m = mon_from_point(nsx + slots[drag_idx].lab.w / 2,
+                           nsy + slots[drag_idx].lab.h / 2);
     if (m < 0 || m >= n_mons) m = drag_mon;
 
     uint32_t v[2] = { (uint32_t)nsx, (uint32_t)nsy };
@@ -702,7 +879,7 @@ void icons_save(void) {
         fprintf(stderr, "sbpcwm: cannot write icon state %s\n", path);
         return;
     }
-    fprintf(f, "-- sbpcwm desktop icon state (managed by sbpcwm; edit config.lua for defaults)\n");
+    fprintf(f, "-- sbcwm desktop icon state (managed by sbpcwm; edit config.lua for defaults)\n");
     fprintf(f, "icons = {\n");
     for (int i = 0; i < cfg->nicons; i++) {
         LauncherIcon *ic = &cfg->icons[i];
@@ -730,5 +907,5 @@ void icons_load_state(Config *c) {
     char path[512];
     snprintf(path, sizeof(path), "%s/.config/sbcwm/icons.lua", home);
     if (access(path, F_OK) != 0) return;
-    config_load_icons(path, c);
+    config_apply_icon_state(path, c);
 }

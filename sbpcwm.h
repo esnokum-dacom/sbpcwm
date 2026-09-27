@@ -14,16 +14,25 @@ struct Config;
 #define SPAWN_SEARCH_STEP 30
 #define SPAWN_SEARCH_MAX  40
 
-/* Physics (window <-> window collisions) */
-#define PHYS_ENABLED      1     /* master switch */
-#define PHYS_RESTITUTION  0.55f /* bounciness of window-window hits (0..1) */
-#define PHYS_FRICTION     4.0f  /* exponential damping per second */
-#define PHYS_STOP_SPEED   8.0f  /* px/s below which a window goes back to sleep */
-#define PHYS_VMAX         3200.0f /* clamp so nothing teleports */
-#define PHYS_SLOP         0.5f  /* allowed penetration before separation (px) */
-#define PHYS_CORRECT      0.8f  /* fraction of penetration corrected per tick */
-#define THROW_WINDOW_MS   120   /* pointer history window for throw velocity */
-#define THROW_BOOST       1.15f /* multiplier applied to release flick speed */
+#define PHYS_ENABLED      1
+#define PHYS_RESTITUTION  0.70f  /* bounciness of window-window hits       */
+#define PHYS_FRICTION     3.4f   /* exponential damping per second         */
+#define PHYS_STOP_SPEED   8.0f   /* px/s below which a window sleeps       */
+#define PHYS_VMAX         3200.0f
+#define PHYS_SLOP         0.5f   /* allowed overlap, in px, before pushing */
+#define PHYS_CORRECT      0.9f   /* fraction of the overlap solved per pass */
+#define PHYS_BOUNCE_MIN   45.0f  /* closing speed under which a hit only
+                                    separates, it does not bounce: keeps
+                                    touching windows from shivering        */
+#define PHYS_MAX_STEP     6.0f   /* px a window may travel per collision
+                                    sub-step: above this it could jump
+                                    clean over another window              */
+#define PHYS_SUBSTEPS     16     /* upper bound on sub-steps per frame     */
+#define PHYS_ITERATIONS   2      /* relaxation passes per sub-step         */
+#define THROW_WINDOW_MS   120
+#define THROW_BOOST       1.15f
+
+#define FRAME_MIN_MS      10
 
 #define win (client *t = 0, *c = list; c && t != list->prev; t = c, c = c->next)
 
@@ -59,10 +68,14 @@ typedef struct client {
   int x, y;
   int width, height;
   int oldx, oldy, oldwidth, oldheight;
+  unsigned char shaped, tb_shaped;
+  int clip_r[4], tb_clip_r[4];
   int basew, baseh, incw, inch, maxw, maxh, minw, minh;
   float mina, maxa;
   float cx, cy;
   float vx, vy;
+  uint8_t       vdepth;
+  xcb_visualid_t vid;
   unsigned char awake;
 } client;
 
@@ -90,9 +103,15 @@ typedef struct {
   unsigned long cs[16];
   unsigned long background;
   unsigned long foreground;
+  unsigned long deco;
+  unsigned long deco_dim;
+  unsigned long icon_text;
+  unsigned short deco_rgb[3];
+  unsigned short deco_dim_rgb[3];
 } ColorScheme;
 
 const char *get_home(void);
+xcb_atom_t get_atom(const char *name);
 
 extern xcb_window_t root;
 extern Display *dpy;
@@ -117,6 +136,8 @@ void button_release(xcb_button_release_event_t *e);
 void configure_request(xcb_configure_request_event_t *e);
 void input_grab(xcb_window_t root);
 void key_press(xcb_key_press_event_t *e);
+xcb_keysym_t event_keysym(xcb_key_press_event_t *e);
+int event_text(xcb_key_press_event_t *e, char *buf, size_t n);
 void notify_property(xcb_property_notify_event_t *e);
 void notify_unmap(xcb_unmap_notify_event_t *e);
 void map_request(xcb_map_request_event_t *e);
@@ -136,6 +157,8 @@ void win_center(const Arg arg);
 void win_del(xcb_window_t w);
 void win_fs(const Arg arg);
 void win_focus(client *c);
+void focus_win_id(xcb_window_t w);
+void sbcs_manage(xcb_window_t w);
 void titlebar_focus(xcb_window_t w);
 void win_kill(const Arg arg);
 void win_prev(const Arg arg);
@@ -167,14 +190,18 @@ void titlebar_draw(client *c);
 void titlebar_del(client *c);
 client *client_from_titlebar(xcb_window_t w);
 int is_titlebar(xcb_window_t w);
+client *client_of_window(xcb_window_t w);
 
 void update_borders(void);
 
 void update_border_widths(void);
 void fonts_reload(void);
+void apply_titlebars(void);
 
 unsigned long hex_to_xcolor(const char *hex);
 void load_colors(void);
+void apply_colors(void);
+void titlebar_redraw_all(void);
 void xcolor_to_xftcolor(unsigned long pixel, XftColor *xft);
 
 void client_move(client *c, int x, int y);
@@ -190,6 +217,7 @@ void win_size(xcb_window_t w, int *x, int *y, unsigned int *wd, unsigned int *ht
 void handle_sigusr2(int sig);
 
 void reload_config(const Arg arg);
+int  reload_config_quiet(int announce);
 
 void update_client_list_stacking(void);
 

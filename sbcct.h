@@ -1,6 +1,4 @@
 
-/* Sowm C Binding Config Type*/
-
 #pragma once
 
 #include <X11/X.h>
@@ -32,7 +30,7 @@ typedef struct {
 typedef struct {
     char  *name;
     char *image;
-    char  **cmd; 
+    char  **cmd;
     int    ncmd;
     int    x, y;
     int    mon;
@@ -45,15 +43,14 @@ typedef struct Config {
 
     uint32_t pan_step;
     uint8_t titlebar;
-    uint8_t ui;
-
-    uint8_t xr_colors;
+    uint8_t focus_follow;
 
     uint8_t border;
     uint16_t border_width;
 
     char *ctxbg;
     char *ctxborder;
+    char *deco;
 
     struct key *keys;
     int   nkeys;
@@ -73,5 +70,6 @@ extern Config *cfg;
 Config *config_load(const char *path);
 void config_free(Config *cfg);
 void config_load_icons(const char *path, Config *cfg);
+void config_apply_icon_state(const char *path, Config *cfg);
 
 unsigned int mod_from_name(const char *n);
